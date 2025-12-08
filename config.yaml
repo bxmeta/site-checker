@@ -1,0 +1,32 @@
+telegram:
+  bot_token: "YOUR_BOT_TOKEN"
+  admin_ids: [12345]
+
+scheduler:
+  interval_minutes: 3
+
+default:
+  retry_count: 3
+  retry_interval_minutes: 5
+  timeout_seconds: 10
+
+sites:
+  - id: "site1"
+    name: "Example"
+    url: "https://example.com"
+    support_level: "premium"
+    check_ssl: true
+    check_http_code: true
+    expected_code: 200
+    keywords: ["Example", "Domain"]
+    notify_users: [11111111, 22222222]
+
+  - id: "site2"
+    name: "My API"
+    url: "https://api.example.com/health"
+    support_level: "standard"
+    check_ssl: true
+    check_http_code: true
+    expected_code: 200
+    keywords: []
+    notify_users: [11111111]

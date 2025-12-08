@@ -1,0 +1,8 @@
+{
+  "site1": {
+    "status": "UP",
+    "fail_streak": 0,
+    "last_status_change": "2025-01-01T12:00:00+04:00",
+    "last_notify_at": "2025-01-01T12:00:00+04:00"
+  }
+}
