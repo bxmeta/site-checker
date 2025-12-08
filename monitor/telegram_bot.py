@@ -135,19 +135,19 @@ def _edit_site_keyboard(site_id: str) -> InlineKeyboardMarkup:
     """Создаёт клавиатуру для редактирования полей сайта."""
     buttons = [
         [
-            InlineKeyboardButton(text="📝 Название", callback_data=f"edit_field:{site_id}:name"),
+            InlineKeyboardButton(text="📝 Имя", callback_data=f"edit_field:{site_id}:name"),
             InlineKeyboardButton(text="🔗 URL", callback_data=f"edit_field:{site_id}:url")
         ],
         [
-            InlineKeyboardButton(text="⭐ Уровень поддержки", callback_data=f"edit_field:{site_id}:support_level"),
-            InlineKeyboardButton(text="📊 Ожидаемый код", callback_data=f"edit_field:{site_id}:expected_code")
+            InlineKeyboardButton(text="⭐ Уровень", callback_data=f"edit_field:{site_id}:support_level"),
+            InlineKeyboardButton(text="📊 HTTP код", callback_data=f"edit_field:{site_id}:expected_code")
         ],
         [
-            InlineKeyboardButton(text="🔐 Проверка SSL", callback_data=f"toggle_ssl:{site_id}"),
-            InlineKeyboardButton(text="📡 Проверка HTTP", callback_data=f"toggle_http:{site_id}")
+            InlineKeyboardButton(text="🔐 SSL", callback_data=f"toggle_ssl:{site_id}"),
+            InlineKeyboardButton(text="📡 HTTP", callback_data=f"toggle_http:{site_id}")
         ],
         [
-            InlineKeyboardButton(text="🔑 Ключевые слова", callback_data=f"edit_field:{site_id}:keywords")
+            InlineKeyboardButton(text="🔑 Ключевые слова", callback_data=f"edit_keywords:{site_id}")
         ],
         [InlineKeyboardButton(text="◀️ Назад", callback_data=f"site_info:{site_id}")]
     ]
@@ -196,8 +196,28 @@ def _site_users_keyboard(site_id: str) -> InlineKeyboardMarkup:
                 )
             ])
 
-    buttons.append([InlineKeyboardButton(text="➕ Добавить подписчика", callback_data=f"add_user:{site_id}")])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_user:{site_id}")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"site_info:{site_id}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _keywords_keyboard(site_id: str) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру управления ключевыми словами."""
+    site = get_site_by_id(_config, site_id) if _config else None
+    buttons = []
+
+    if site and site.keywords:
+        for kw in site.keywords:
+            buttons.append([
+                InlineKeyboardButton(text=f"🔑 {kw}", callback_data="noop"),
+                InlineKeyboardButton(text="❌", callback_data=f"remove_kw:{site_id}:{kw}")
+            ])
+
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_keyword:{site_id}")])
+    if site and site.keywords:
+        buttons.append([InlineKeyboardButton(text="🗑 Очистить все", callback_data=f"clear_keywords:{site_id}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"edit_site:{site_id}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -702,6 +722,35 @@ async def process_edit_value(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
+
+    # Проверяем, добавляем ли ключевые слова
+    add_keyword_site_id = data.get("add_keyword_site_id")
+    if add_keyword_site_id:
+        site = get_site_by_id(_config, add_keyword_site_id) if _config else None
+        if not site:
+            await message.answer("❌ Сайт не найден")
+            await state.clear()
+            return
+
+        new_keywords = [k.strip() for k in message.text.strip().split(",") if k.strip()]
+        all_keywords = (site.keywords or []) + new_keywords
+        success = update_site(_config, add_keyword_site_id, _config_path, keywords=all_keywords)
+
+        if success:
+            # Удаляем сообщение пользователя для чистоты
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer(
+                f"✅ Добавлено: {', '.join(new_keywords)}",
+                reply_markup=_keywords_keyboard(add_keyword_site_id)
+            )
+        else:
+            await message.answer("❌ Ошибка добавления")
+        await state.clear()
+        return
+
     site_id = data.get("edit_site_id")
     field = data.get("edit_field")
 
@@ -718,12 +767,15 @@ async def process_edit_value(message: Message, state: FSMContext) -> None:
         except ValueError:
             await message.answer("❌ Введите числовое значение HTTP кода")
             return
-    elif field == "keywords":
-        value = [k.strip() for k in value.split(",") if k.strip()]
 
     success = update_site(_config, site_id, _config_path, **{field: value})
 
     if success:
+        # Удаляем сообщение пользователя для чистоты
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.answer(
             f"✅ Поле успешно обновлено!",
             reply_markup=_site_info_keyboard(site_id)
@@ -806,6 +858,116 @@ async def callback_toggle_http(callback: CallbackQuery) -> None:
         await callback.message.edit_reply_markup(reply_markup=_edit_site_keyboard(site_id))
     else:
         await callback.answer("❌ Ошибка обновления", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("edit_keywords:"))
+async def callback_edit_keywords(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обработчик редактирования ключевых слов."""
+    await state.clear()
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    site_id = callback.data.split(":")[1]
+    site = get_site_by_id(_config, site_id) if _config else None
+
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
+        return
+
+    count = len(site.keywords) if site.keywords else 0
+    await callback.message.edit_text(
+        f"🔑 <b>Ключевые слова</b>\n\n"
+        f"Сайт: {site.name}\n"
+        f"Количество: {count}",
+        parse_mode="HTML",
+        reply_markup=_keywords_keyboard(site_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("remove_kw:"))
+async def callback_remove_keyword(callback: CallbackQuery) -> None:
+    """Обработчик удаления ключевого слова."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    parts = callback.data.split(":", 2)
+    site_id = parts[1]
+    keyword = parts[2]
+
+    site = get_site_by_id(_config, site_id) if _config else None
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
+        return
+
+    new_keywords = [kw for kw in site.keywords if kw != keyword]
+    success = update_site(_config, site_id, _config_path, keywords=new_keywords)
+
+    if success:
+        await callback.answer(f"✅ Удалено: {keyword}")
+        count = len(new_keywords)
+        await callback.message.edit_text(
+            f"🔑 <b>Ключевые слова</b>\n\n"
+            f"Сайт: {site.name}\n"
+            f"Количество: {count}",
+            parse_mode="HTML",
+            reply_markup=_keywords_keyboard(site_id)
+        )
+    else:
+        await callback.answer("❌ Ошибка удаления", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("clear_keywords:"))
+async def callback_clear_keywords(callback: CallbackQuery) -> None:
+    """Обработчик очистки всех ключевых слов."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    site_id = callback.data.split(":")[1]
+    site = get_site_by_id(_config, site_id) if _config else None
+
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
+        return
+
+    success = update_site(_config, site_id, _config_path, keywords=[])
+
+    if success:
+        await callback.answer("✅ Все ключевые слова удалены")
+        await callback.message.edit_text(
+            f"🔑 <b>Ключевые слова</b>\n\n"
+            f"Сайт: {site.name}\n"
+            f"Количество: 0",
+            parse_mode="HTML",
+            reply_markup=_keywords_keyboard(site_id)
+        )
+    else:
+        await callback.answer("❌ Ошибка очистки", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("add_keyword:"))
+async def callback_add_keyword(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обработчик добавления ключевого слова."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    site_id = callback.data.split(":")[1]
+    await state.update_data(add_keyword_site_id=site_id)
+    await state.set_state(EditSiteStates.waiting_for_value)
+
+    await callback.message.edit_text(
+        "🔑 <b>Добавление ключевого слова</b>\n\n"
+        "Введите ключевое слово или несколько через запятую:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"edit_keywords:{site_id}")]
+        ])
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("delete_site:"))
