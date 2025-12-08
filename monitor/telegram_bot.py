@@ -250,8 +250,10 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.callback_query(F.data == "menu_main")
-async def callback_main_menu(callback: CallbackQuery) -> None:
+async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
     """Возврат в главное меню."""
+    await state.clear()  # Сбрасываем любое ожидание ввода
+
     user_id = callback.from_user.id
     full_name = callback.from_user.full_name or "Пользователь"
     role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
@@ -268,8 +270,9 @@ async def callback_main_menu(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu_myid")
-async def callback_menu_myid(callback: CallbackQuery) -> None:
+async def callback_menu_myid(callback: CallbackQuery, state: FSMContext) -> None:
     """Показать ID через меню."""
+    await state.clear()
     user_id = callback.from_user.id
     await callback.message.edit_text(
         f"🆔 Ваш Telegram ID:\n\n<code>{user_id}</code>\n\n"
@@ -283,8 +286,9 @@ async def callback_menu_myid(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu_my_sites")
-async def callback_menu_my_sites(callback: CallbackQuery) -> None:
+async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> None:
     """Мои сайты через меню."""
+    await state.clear()
     if _config is None:
         await callback.answer("❌ Конфигурация не загружена", show_alert=True)
         return
@@ -327,8 +331,9 @@ async def callback_menu_my_sites(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu_status_all")
-async def callback_menu_status_all(callback: CallbackQuery) -> None:
+async def callback_menu_status_all(callback: CallbackQuery, state: FSMContext) -> None:
     """Статус всех сайтов через меню."""
+    await state.clear()
     if not _is_admin(callback.from_user.id):
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
@@ -360,8 +365,9 @@ async def callback_menu_status_all(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu_check_now")
-async def callback_menu_check_now(callback: CallbackQuery) -> None:
+async def callback_menu_check_now(callback: CallbackQuery, state: FSMContext) -> None:
     """Проверка всех сайтов через меню."""
+    await state.clear()
     if not _is_admin(callback.from_user.id):
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
@@ -507,8 +513,9 @@ async def cmd_sites(message: Message) -> None:
 
 
 @router.callback_query(F.data == "sites_list")
-async def callback_sites_list(callback: CallbackQuery) -> None:
+async def callback_sites_list(callback: CallbackQuery, state: FSMContext) -> None:
     """Обработчик возврата к списку сайтов."""
+    await state.clear()
     if not _is_admin(callback.from_user.id):
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
@@ -535,8 +542,9 @@ async def callback_sites_page(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("site_info:"))
-async def callback_site_info(callback: CallbackQuery) -> None:
+async def callback_site_info(callback: CallbackQuery, state: FSMContext) -> None:
     """Обработчик просмотра информации о сайте."""
+    await state.clear()
     if not _is_admin(callback.from_user.id):
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
