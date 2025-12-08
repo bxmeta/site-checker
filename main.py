@@ -57,10 +57,11 @@ async def main() -> None:
     try:
         scheduler_task = scheduler.start()
 
-        logger.info("Выполняю первоначальную проверку всех сайтов...")
-        await scheduler.check_all_sites()
-
         logger.info("Запускаю Telegram-бота...")
+
+        # Запускаем первоначальную проверку в фоне, не блокируя бота
+        asyncio.create_task(scheduler.check_all_sites())
+
         await start_bot(bot, dp)
 
     except asyncio.CancelledError:
