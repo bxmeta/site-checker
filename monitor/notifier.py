@@ -112,12 +112,31 @@ class TelegramNotifier:
         """Форматирует сообщение о падении сайта."""
         status_code_str = str(check_result.status_code) if check_result.status_code else "N/A"
 
+        # Разные заголовки для разных типов ошибок
+        error_type = check_result.error_type or "unknown"
+
+        if error_type == "keyword_missing":
+            title = "⚠️ <b>Контент изменился</b>"
+            description = "Ключевое слово не найдено на странице"
+        elif error_type == "wrong_code":
+            title = "⚠️ <b>Неверный код ответа</b>"
+            description = f"Ожидался {site.expected_code}, получен {status_code_str}"
+        elif error_type in ("ssl_expired", "ssl_mismatch"):
+            title = "🔐 <b>Проблема с SSL</b>"
+            description = check_result.error
+        elif error_type == "timeout":
+            title = "🚨 <b>Сайт недоступен</b>"
+            description = "Превышено время ожидания"
+        else:
+            title = "🚨 <b>Сайт недоступен</b>"
+            description = check_result.error
+
         return (
-            f"🚨 <b>Сайт недоступен</b>\n"
+            f"{title}\n"
             f"Название: {site.name}\n"
             f"URL: {site.url}\n"
-            f"Статус поддержки: {site.support_level}\n"
-            f"Ошибка: {check_result.error}\n"
+            f"Поддержка: {site.support_level}\n"
+            f"Проблема: {description}\n"
             f"Код: {status_code_str}\n"
             f"Время: {format_for_message()}"
         )
