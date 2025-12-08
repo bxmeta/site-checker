@@ -13,6 +13,11 @@ class TelegramConfig:
     """Конфигурация Telegram."""
     bot_token: str
     admin_ids: List[int]
+    use_webhook: bool = False
+    webhook_url: str = ""  # https://yourdomain.com/webhook
+    webhook_path: str = "/webhook"
+    webhook_host: str = "0.0.0.0"
+    webhook_port: int = 8080
 
 
 @dataclass
@@ -78,7 +83,12 @@ def load_config(config_path: str = "config.yaml") -> Config:
     telegram_data = data.get("telegram", {})
     telegram = TelegramConfig(
         bot_token=telegram_data.get("bot_token", ""),
-        admin_ids=telegram_data.get("admin_ids", [])
+        admin_ids=telegram_data.get("admin_ids", []),
+        use_webhook=telegram_data.get("use_webhook", False),
+        webhook_url=telegram_data.get("webhook_url", ""),
+        webhook_path=telegram_data.get("webhook_path", "/webhook"),
+        webhook_host=telegram_data.get("webhook_host", "0.0.0.0"),
+        webhook_port=telegram_data.get("webhook_port", 8080)
     )
 
     scheduler_data = data.get("scheduler", {})
@@ -159,7 +169,12 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
     data = {
         "telegram": {
             "bot_token": config.telegram.bot_token,
-            "admin_ids": config.telegram.admin_ids
+            "admin_ids": config.telegram.admin_ids,
+            "use_webhook": config.telegram.use_webhook,
+            "webhook_url": config.telegram.webhook_url,
+            "webhook_path": config.telegram.webhook_path,
+            "webhook_host": config.telegram.webhook_host,
+            "webhook_port": config.telegram.webhook_port
         },
         "scheduler": {
             "interval_minutes": config.scheduler.interval_minutes

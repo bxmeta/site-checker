@@ -10,7 +10,7 @@ from monitor.config_loader import load_config
 from monitor.state_manager import StateManager
 from monitor.notifier import TelegramNotifier
 from monitor.scheduler import MonitorScheduler
-from monitor.telegram_bot import setup_bot, start_bot
+from monitor.telegram_bot import setup_bot, start_bot, start_bot_webhook, run_webhook_server
 from monitor.logger import setup_logger
 
 
@@ -57,12 +57,23 @@ async def main() -> None:
     try:
         scheduler_task = scheduler.start()
 
-        logger.info("Запускаю Telegram-бота...")
-
         # Запускаем первоначальную проверку в фоне, не блокируя бота
         asyncio.create_task(scheduler.check_all_sites())
 
-        await start_bot(bot, dp)
+        # Выбираем режим работы бота
+        if config.telegram.use_webhook:
+            logger.info("Запускаю Telegram-бота в режиме webhook...")
+            app = await start_bot_webhook(
+                bot, dp,
+                webhook_url=config.telegram.webhook_url,
+                webhook_path=config.telegram.webhook_path,
+                host=config.telegram.webhook_host,
+                port=config.telegram.webhook_port
+            )
+            await run_webhook_server(app, config.telegram.webhook_host, config.telegram.webhook_port)
+        else:
+            logger.info("Запускаю Telegram-бота в режиме polling...")
+            await start_bot(bot, dp)
 
     except asyncio.CancelledError:
         logger.info("Задачи отменены")

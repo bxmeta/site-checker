@@ -7,6 +7,7 @@ import os
 import re
 from typing import Optional
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -16,6 +17,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from .config_loader import (
     Config, SiteConfig, get_sites_for_user, get_site_by_id,
@@ -200,6 +202,24 @@ def _site_users_keyboard(site_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Создаёт главное меню с кнопками."""
+    buttons = [
+        [InlineKeyboardButton(text="🆔 Мой ID", callback_data="menu_myid")],
+        [InlineKeyboardButton(text="📋 Мои сайты", callback_data="menu_my_sites")],
+    ]
+
+    if _is_admin(user_id):
+        buttons.extend([
+            [InlineKeyboardButton(text="📊 Статус всех сайтов", callback_data="menu_status_all")],
+            [InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="menu_check_now")],
+            [InlineKeyboardButton(text="⚙️ Управление сайтами", callback_data="sites_list")],
+            [InlineKeyboardButton(text="➕ Добавить сайт", callback_data="add_site")],
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     """Обработчик команды /start."""
@@ -217,26 +237,154 @@ async def cmd_start(message: Message) -> None:
         _save_users(users)
         logger.info(f"Новый пользователь зарегистрирован: {user_id} (@{username})")
 
-    admin_commands = ""
-    if _is_admin(user_id):
-        admin_commands = (
-            "\n<b>Команды администратора:</b>\n"
-            "/status_all — статус всех сайтов\n"
-            "/check_now — мгновенная проверка\n"
-            "/sites — управление сайтами\n"
-            "/add_site — добавить сайт\n"
-        )
+    role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
 
     await message.answer(
         f"👋 Привет, {full_name}!\n\n"
-        f"Вы зарегистрированы в системе мониторинга.\n"
-        f"Ваш Telegram ID: <code>{user_id}</code>\n\n"
-        f"<b>Доступные команды:</b>\n"
-        f"/myid — показать ваш Telegram ID\n"
-        f"/my_sites — список ваших сайтов"
-        f"{admin_commands}",
-        parse_mode="HTML"
+        f"🆔 Ваш ID: <code>{user_id}</code>\n"
+        f"🔑 Роль: {role}\n\n"
+        f"Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=_main_menu_keyboard(user_id)
     )
+
+
+@router.callback_query(F.data == "menu_main")
+async def callback_main_menu(callback: CallbackQuery) -> None:
+    """Возврат в главное меню."""
+    user_id = callback.from_user.id
+    full_name = callback.from_user.full_name or "Пользователь"
+    role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
+
+    await callback.message.edit_text(
+        f"👋 Привет, {full_name}!\n\n"
+        f"🆔 Ваш ID: <code>{user_id}</code>\n"
+        f"🔑 Роль: {role}\n\n"
+        f"Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=_main_menu_keyboard(user_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu_myid")
+async def callback_menu_myid(callback: CallbackQuery) -> None:
+    """Показать ID через меню."""
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        f"🆔 Ваш Telegram ID:\n\n<code>{user_id}</code>\n\n"
+        f"Используйте этот ID для добавления в подписчики сайтов.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu_my_sites")
+async def callback_menu_my_sites(callback: CallbackQuery) -> None:
+    """Мои сайты через меню."""
+    if _config is None:
+        await callback.answer("❌ Конфигурация не загружена", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    sites = get_sites_for_user(_config, user_id)
+
+    if not sites:
+        await callback.message.edit_text(
+            "📋 <b>Мои сайты</b>\n\n"
+            "Вы не подписаны на уведомления ни одного сайта.\n\n"
+            "Попросите администратора добавить ваш ID в подписчики.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    lines = ["📋 <b>Мои сайты:</b>\n"]
+    for site in sites:
+        state = _state_manager.get_state(site.id) if _state_manager else None
+        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
+        status_text = state.status if state else "N/A"
+
+        lines.append(
+            f"{status_emoji} <b>{site.name}</b>\n"
+            f"   Статус: {status_text} | Поддержка: {site.support_level}\n"
+        )
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu_status_all")
+async def callback_menu_status_all(callback: CallbackQuery) -> None:
+    """Статус всех сайтов через меню."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    if _config is None or _state_manager is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
+        return
+
+    lines = ["📊 <b>Статус всех сайтов:</b>\n"]
+
+    for site in _config.sites:
+        state = _state_manager.get_state(site.id)
+        status_emoji = "🟢" if state.status == "UP" else "🔴"
+
+        lines.append(
+            f"{status_emoji} <b>{site.name}</b>\n"
+            f"   Статус: {state.status} | Ошибок подряд: {state.fail_streak}\n"
+        )
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_status_all")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu_check_now")
+async def callback_menu_check_now(callback: CallbackQuery) -> None:
+    """Проверка всех сайтов через меню."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    if _config is None or _state_manager is None or _notifier is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
+        return
+
+    await callback.answer("⏳ Запускаю проверку...")
+
+    try:
+        report = await run_immediate_check(_config, _state_manager, _notifier)
+        await callback.message.edit_text(
+            f"📋 <b>Результаты проверки:</b>\n\n{report}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data="menu_check_now")],
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при мгновенной проверке: {e}")
+        await callback.message.answer(f"❌ Ошибка: {e}")
 
 
 @router.message(Command("myid"))
@@ -1070,17 +1218,10 @@ def setup_bot(
     return bot, dp
 
 
-async def start_bot(bot: Bot, dp: Dispatcher) -> None:
-    """
-    Запускает бота.
-
-    Args:
-        bot: Экземпляр бота
-        dp: Диспетчер
-    """
-    # Устанавливаем меню команд
+async def _setup_bot_commands(bot: Bot) -> None:
+    """Устанавливает меню команд бота."""
     commands = [
-        BotCommand(command="start", description="Регистрация и информация"),
+        BotCommand(command="start", description="Главное меню"),
         BotCommand(command="myid", description="Показать мой Telegram ID"),
         BotCommand(command="my_sites", description="Мои сайты"),
         BotCommand(command="status_all", description="Статус всех сайтов (админ)"),
@@ -1091,5 +1232,85 @@ async def start_bot(bot: Bot, dp: Dispatcher) -> None:
     await bot.set_my_commands(commands)
     logger.info("Меню команд установлено")
 
-    logger.info("Telegram-бот запущен")
+
+async def start_bot(bot: Bot, dp: Dispatcher) -> None:
+    """
+    Запускает бота в режиме polling.
+
+    Args:
+        bot: Экземпляр бота
+        dp: Диспетчер
+    """
+    await _setup_bot_commands(bot)
+    logger.info("Telegram-бот запущен (polling)")
     await dp.start_polling(bot)
+
+
+async def start_bot_webhook(
+    bot: Bot,
+    dp: Dispatcher,
+    webhook_url: str,
+    webhook_path: str,
+    host: str,
+    port: int
+) -> web.Application:
+    """
+    Запускает бота в режиме webhook.
+
+    Args:
+        bot: Экземпляр бота
+        dp: Диспетчер
+        webhook_url: Полный URL вебхука (https://domain.com/webhook)
+        webhook_path: Путь вебхука (/webhook)
+        host: Хост для прослушивания
+        port: Порт для прослушивания
+
+    Returns:
+        aiohttp Application
+    """
+    await _setup_bot_commands(bot)
+
+    # Удаляем старый webhook и устанавливаем новый
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook установлен: {webhook_url}")
+
+    # Создаём aiohttp приложение
+    app = web.Application()
+
+    # Настраиваем webhook handler
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot
+    )
+    webhook_requests_handler.register(app, path=webhook_path)
+
+    # Настраиваем startup/shutdown
+    setup_application(app, dp, bot=bot)
+
+    logger.info(f"Telegram-бот запущен (webhook) на {host}:{port}")
+
+    return app
+
+
+async def run_webhook_server(app: web.Application, host: str, port: int) -> None:
+    """
+    Запускает webhook сервер.
+
+    Args:
+        app: aiohttp Application
+        host: Хост
+        port: Порт
+    """
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    # Держим сервер запущенным
+    while True:
+        await asyncio.sleep(3600)
+
+
+# Нужен импорт asyncio для run_webhook_server
+import asyncio
