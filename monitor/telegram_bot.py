@@ -13,7 +13,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand
 )
 
 from .config_loader import (
@@ -1077,5 +1078,18 @@ async def start_bot(bot: Bot, dp: Dispatcher) -> None:
         bot: Экземпляр бота
         dp: Диспетчер
     """
+    # Устанавливаем меню команд
+    commands = [
+        BotCommand(command="start", description="Регистрация и информация"),
+        BotCommand(command="myid", description="Показать мой Telegram ID"),
+        BotCommand(command="my_sites", description="Мои сайты"),
+        BotCommand(command="status_all", description="Статус всех сайтов (админ)"),
+        BotCommand(command="check_now", description="Проверить все сейчас (админ)"),
+        BotCommand(command="sites", description="Управление сайтами (админ)"),
+        BotCommand(command="add_site", description="Добавить сайт (админ)"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("Меню команд установлено")
+
     logger.info("Telegram-бот запущен")
     await dp.start_polling(bot)
