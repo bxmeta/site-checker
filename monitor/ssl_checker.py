@@ -9,6 +9,22 @@ from datetime import datetime
 from typing import List, Optional
 
 
+def _to_punycode(hostname: str) -> str:
+    """
+    Конвертирует IDN-домен (например, кириллический) в Punycode.
+
+    Args:
+        hostname: Имя хоста (может быть IDN или ASCII)
+
+    Returns:
+        ASCII-совместимое имя хоста (Punycode)
+    """
+    try:
+        return hostname.encode('idna').decode('ascii')
+    except (UnicodeError, UnicodeDecodeError):
+        return hostname
+
+
 @dataclass
 class SSLCheckResult:
     """Результат проверки SSL-сертификата."""
@@ -26,15 +42,16 @@ def _get_certificate_info(hostname: str, port: int = 443) -> dict:
     Получает информацию о SSL-сертификате.
 
     Args:
-        hostname: Имя хоста
+        hostname: Имя хоста (поддерживает IDN/кириллицу)
         port: Порт (по умолчанию 443)
 
     Returns:
         Словарь с информацией о сертификате
     """
+    ascii_hostname = _to_punycode(hostname)
     context = ssl.create_default_context()
-    with socket.create_connection((hostname, port), timeout=10) as sock:
-        with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+    with socket.create_connection((ascii_hostname, port), timeout=10) as sock:
+        with context.wrap_socket(sock, server_hostname=ascii_hostname) as ssock:
             cert = ssock.getpeercert()
             return cert
 
@@ -66,8 +83,11 @@ def _hostname_matches_cert(hostname: str, cn: Optional[str], san_list: List[str]
     """
     Проверяет, соответствует ли имя хоста сертификату.
 
+    Поддерживает IDN-домены: сравнивает как оригинальное имя,
+    так и его Punycode-версию с именами в сертификате.
+
     Args:
-        hostname: Имя хоста для проверки
+        hostname: Имя хоста для проверки (может быть IDN)
         cn: Common Name из сертификата
         san_list: Список Subject Alternative Names
 
@@ -78,14 +98,19 @@ def _hostname_matches_cert(hostname: str, cn: Optional[str], san_list: List[str]
     if cn:
         all_names.append(cn)
 
+    ascii_hostname = _to_punycode(hostname)
+    hostnames_to_check = {hostname, ascii_hostname}
+
     for name in all_names:
         if name.startswith("*."):
             wildcard_domain = name[2:]
-            parts = hostname.split(".", 1)
-            if len(parts) == 2 and parts[1] == wildcard_domain:
+            for h in hostnames_to_check:
+                parts = h.split(".", 1)
+                if len(parts) == 2 and parts[1] == wildcard_domain:
+                    return True
+        else:
+            if name in hostnames_to_check:
                 return True
-        elif name == hostname:
-            return True
 
     return False
 
