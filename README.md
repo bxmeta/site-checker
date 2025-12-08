@@ -6,10 +6,12 @@
 
 - **HTTP-проверки**: проверка кода ответа
 - **SSL-проверки**: валидность сертификата, срок действия, соответствие домену
+- **IDN-домены**: поддержка кириллических доменов (например, `сайт.рф`)
 - **Ключевые слова**: поиск заданных слов в HTML-контенте
 - **Retry-логика**: повторные попытки при неудаче
 - **Уведомления в Telegram**: при падении и восстановлении сайтов
-- **Telegram-бот**: управление мониторингом через команды
+- **Telegram-бот**: управление мониторингом через inline-кнопки
+- **Webhook / Polling**: два режима работы бота
 - **Планировщик**: автоматическая проверка по расписанию
 - **Логирование**: запись всех проверок в файл
 
@@ -58,8 +60,108 @@ sites:
 
 ## Запуск
 
+### Простой запуск (polling)
+
 ```bash
 python main.py
+```
+
+### Запуск в фоне
+
+```bash
+nohup python main.py > bot.log 2>&1 &
+```
+
+### Режим Webhook (рекомендуется для продакшена)
+
+Webhook работает быстрее polling и надёжнее для продакшена.
+
+#### 1. Настройте config.yaml
+
+```yaml
+telegram:
+  bot_token: "YOUR_BOT_TOKEN"
+  admin_ids: [123456789]
+  use_webhook: true
+  webhook_url: "https://your-domain.com/webhook"
+  webhook_path: "/webhook"
+  webhook_host: "127.0.0.1"
+  webhook_port: 8000
+```
+
+#### 2. Настройте Nginx
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    location / {
+        return 301 https://$server_name$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location /webhook {
+        proxy_pass http://127.0.0.1:8000/webhook;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+#### 3. Перезапустите Nginx
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+### Автозапуск (systemd)
+
+Создайте файл `/etc/systemd/system/site-monitor.service`:
+
+```ini
+[Unit]
+Description=Site Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/path/to/site-checker
+ExecStart=/usr/bin/python3 /path/to/site-checker/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Активируйте сервис:
+
+```bash
+# Перезагрузить systemd
+systemctl daemon-reload
+
+# Включить автозапуск
+systemctl enable site-monitor
+
+# Запустить сервис
+systemctl start site-monitor
+
+# Проверить статус
+systemctl status site-monitor
+
+# Посмотреть логи
+journalctl -u site-monitor -f
 ```
 
 ## Команды Telegram-бота
