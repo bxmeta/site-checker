@@ -1,6 +1,7 @@
 """
 Модуль HTTP-проверок сайтов.
 """
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -11,6 +12,14 @@ import aiohttp
 from .config_loader import SiteConfig, DefaultConfig
 from .ssl_checker import check_ssl
 from .keyword_checker import check_keywords
+
+
+def _create_ssl_context() -> ssl.SSLContext:
+    """Создаёт SSL контекст без проверки цепочки (проверяем отдельно)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 @dataclass
@@ -42,8 +51,11 @@ async def check_site(
     start_time = time.time()
 
     try:
+        # Используем свой SSL контекст без проверки цепочки
+        # (проверку SSL делаем отдельно через ssl_checker)
+        ssl_context = _create_ssl_context() if site.url.startswith("https://") else False
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(site.url, ssl=True) as response:
+            async with session.get(site.url, ssl=ssl_context) as response:
                 response_time_ms = int((time.time() - start_time) * 1000)
                 status_code = response.status
                 html_content = await response.text()
