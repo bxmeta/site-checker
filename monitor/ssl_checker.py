@@ -5,8 +5,11 @@ import asyncio
 import ssl
 import socket
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ExtensionOID
 
 
 def _to_punycode(hostname: str) -> str:
@@ -37,46 +40,68 @@ class SSLCheckResult:
     san_list: Optional[List[str]] = None
 
 
-def _get_certificate_info(hostname: str, port: int = 443) -> dict:
+def _get_certificate_binary(hostname: str, port: int = 443) -> bytes:
     """
-    Получает информацию о SSL-сертификате.
+    Получает SSL-сертификат в бинарном формате (DER).
 
     Args:
         hostname: Имя хоста (поддерживает IDN/кириллицу)
         port: Порт (по умолчанию 443)
 
     Returns:
-        Словарь с информацией о сертификате
+        Сертификат в DER формате
     """
     ascii_hostname = _to_punycode(hostname)
-    context = ssl.create_default_context()
+
+    # Используем контекст без проверки цепочки,
+    # чтобы получить сертификат даже если цепочка неполная
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
     with socket.create_connection((ascii_hostname, port), timeout=10) as sock:
         with context.wrap_socket(sock, server_hostname=ascii_hostname) as ssock:
-            cert = ssock.getpeercert()
-            return cert
+            cert_der = ssock.getpeercert(binary_form=True)
+            return cert_der
 
 
-def _parse_cert_date(date_str: str) -> datetime:
-    """Парсит дату сертификата в datetime."""
-    return datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z")
+def _parse_certificate(cert_der: bytes) -> dict:
+    """
+    Парсит сертификат из DER формата с помощью cryptography.
 
+    Args:
+        cert_der: Сертификат в DER формате
 
-def _get_cn_from_subject(subject: tuple) -> Optional[str]:
-    """Извлекает Common Name из subject сертификата."""
-    for item in subject:
-        for key, value in item:
-            if key == "commonName":
-                return value
-    return None
+    Returns:
+        Словарь с информацией о сертификате
+    """
+    cert = x509.load_der_x509_certificate(cert_der)
 
+    # Извлекаем CN из subject
+    cn = None
+    try:
+        cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        if cn_attrs:
+            cn = cn_attrs[0].value
+    except Exception:
+        pass
 
-def _get_san_list(cert: dict) -> List[str]:
-    """Извлекает список Subject Alternative Names из сертификата."""
+    # Извлекаем SAN (Subject Alternative Names)
     san_list = []
-    for san_type, san_value in cert.get("subjectAltName", []):
-        if san_type == "DNS":
-            san_list.append(san_value)
-    return san_list
+    try:
+        san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        san_list = [name.value for name in san_ext.value if isinstance(name, x509.DNSName)]
+    except x509.ExtensionNotFound:
+        pass
+
+    # Даты
+    not_after = cert.not_valid_after_utc if hasattr(cert, 'not_valid_after_utc') else cert.not_valid_after.replace(tzinfo=timezone.utc)
+
+    return {
+        'cn': cn,
+        'san_list': san_list,
+        'not_after': not_after
+    }
 
 
 def _hostname_matches_cert(hostname: str, cn: Optional[str], san_list: List[str]) -> bool:
@@ -99,17 +124,18 @@ def _hostname_matches_cert(hostname: str, cn: Optional[str], san_list: List[str]
         all_names.append(cn)
 
     ascii_hostname = _to_punycode(hostname)
-    hostnames_to_check = {hostname, ascii_hostname}
+    hostnames_to_check = {hostname.lower(), ascii_hostname.lower()}
 
     for name in all_names:
-        if name.startswith("*."):
-            wildcard_domain = name[2:]
+        name_lower = name.lower()
+        if name_lower.startswith("*."):
+            wildcard_domain = name_lower[2:]
             for h in hostnames_to_check:
                 parts = h.split(".", 1)
                 if len(parts) == 2 and parts[1] == wildcard_domain:
                     return True
         else:
-            if name in hostnames_to_check:
+            if name_lower in hostnames_to_check:
                 return True
 
     return False
@@ -128,42 +154,37 @@ async def check_ssl(hostname: str, port: int = 443) -> SSLCheckResult:
     """
     try:
         loop = asyncio.get_event_loop()
-        cert = await loop.run_in_executor(
+        cert_der = await loop.run_in_executor(
             None,
-            _get_certificate_info,
+            _get_certificate_binary,
             hostname,
             port
         )
 
-        not_after = cert.get("notAfter")
-        if not not_after:
-            return SSLCheckResult(
-                valid=False,
-                error="SSL certificate has no expiry date",
-                error_type="ssl_expired"
-            )
+        cert_info = _parse_certificate(cert_der)
 
-        expiry_date = _parse_cert_date(not_after)
-        now = datetime.utcnow()
+        expiry_date = cert_info['not_after']
+        now = datetime.now(timezone.utc)
         days_until_expiry = (expiry_date - now).days
+
+        cn = cert_info['cn']
+        san_list = cert_info['san_list']
 
         if days_until_expiry < 0:
             return SSLCheckResult(
                 valid=False,
-                error=f"SSL certificate expired {abs(days_until_expiry)} days ago",
+                error=f"SSL-сертификат истёк {abs(days_until_expiry)} дней назад",
                 error_type="ssl_expired",
                 expiry_date=expiry_date,
-                days_until_expiry=days_until_expiry
+                days_until_expiry=days_until_expiry,
+                subject_cn=cn,
+                san_list=san_list
             )
-
-        subject = cert.get("subject", ())
-        cn = _get_cn_from_subject(subject)
-        san_list = _get_san_list(cert)
 
         if not _hostname_matches_cert(hostname, cn, san_list):
             return SSLCheckResult(
                 valid=False,
-                error=f"SSL certificate CN/SAN mismatch. Hostname: {hostname}, CN: {cn}, SAN: {san_list}",
+                error=f"Сертификат выдан для другого домена. Хост: {hostname}, CN: {cn}, SAN: {san_list}",
                 error_type="ssl_mismatch",
                 expiry_date=expiry_date,
                 days_until_expiry=days_until_expiry,
@@ -179,37 +200,30 @@ async def check_ssl(hostname: str, port: int = 443) -> SSLCheckResult:
             san_list=san_list
         )
 
-    except ssl.SSLCertVerificationError as e:
-        return SSLCheckResult(
-            valid=False,
-            error=f"SSL verification error: {str(e)}",
-            error_type="ssl_mismatch"
-        )
-
     except ssl.SSLError as e:
         return SSLCheckResult(
             valid=False,
-            error=f"SSL error: {str(e)}",
+            error=f"SSL ошибка: {str(e)}",
             error_type="ssl_expired"
         )
 
     except socket.timeout:
         return SSLCheckResult(
             valid=False,
-            error="SSL connection timeout",
+            error="SSL соединение: таймаут",
             error_type="ssl_expired"
         )
 
     except socket.gaierror as e:
         return SSLCheckResult(
             valid=False,
-            error=f"DNS resolution error: {str(e)}",
+            error=f"Ошибка DNS: {str(e)}",
             error_type="ssl_mismatch"
         )
 
     except Exception as e:
         return SSLCheckResult(
             valid=False,
-            error=f"SSL check error: {str(e)}",
+            error=f"Ошибка проверки SSL: {str(e)}",
             error_type="ssl_expired"
         )
