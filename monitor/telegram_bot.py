@@ -27,6 +27,7 @@ from .database import Database
 from .notifier import TelegramNotifier, format_duration
 from .scheduler import run_immediate_check, MonitorScheduler
 from .time_utils import parse_datetime, now_izhevsk
+from .retry_logic import check_with_retry
 
 logger = logging.getLogger("site_monitor")
 
@@ -56,6 +57,31 @@ class EditSiteStates(StatesGroup):
 def _is_admin(user_id: int) -> bool:
     """Проверяет, является ли пользователь администратором."""
     return _config is not None and user_id in _config.telegram.admin_ids
+
+
+async def _check_new_site(site: SiteConfig) -> str:
+    """
+    Немедленно проверяет новый сайт и возвращает результат.
+    Если сайт недоступен — сразу уведомляет всех получателей.
+    """
+    result = await check_with_retry(site, _config.default)
+
+    if result.success:
+        # Всё ок — записываем успешное состояние
+        _database.update_on_success(site.id)
+        return f"✅ Проверка пройдена (код {result.status_code})"
+    else:
+        # Сайт недоступен — сразу помечаем DOWN и уведомляем
+        # Используем retry_count=1 чтобы сразу перейти в DOWN
+        status_changed = _database.update_on_failure(
+            site.id,
+            retry_count=1,  # Сразу DOWN без ожидания retry
+            error_type=result.error_type,
+            error_message=result.error
+        )
+        if status_changed:
+            await _notifier.notify_site_down(site, result)
+        return f"❌ Проблема: {result.error}"
 
 
 def _extract_domain(url: str) -> str:
@@ -1850,7 +1876,20 @@ async def callback_skip_notify(callback: CallbackQuery, state: FSMContext) -> No
             f"URL: {site.url}\n"
             f"Поддержка: {site.support_level}\n"
             f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: —",
+            f"Подписчики: —\n\n"
+            f"⏳ Проверяю...",
+            parse_mode="HTML"
+        )
+        # Немедленная проверка
+        check_result = await _check_new_site(site)
+        await callback.message.edit_text(
+            f"✅ <b>Сайт добавлен!</b>\n\n"
+            f"Название: {site.name}\n"
+            f"URL: {site.url}\n"
+            f"Поддержка: {site.support_level}\n"
+            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
+            f"Подписчики: —\n\n"
+            f"<b>Первая проверка:</b> {check_result}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
@@ -1896,13 +1935,26 @@ async def process_notify_users(message: Message, state: FSMContext) -> None:
     success = add_site(_config, site, _config_path)
 
     if success:
-        await message.answer(
+        status_msg = await message.answer(
             f"✅ <b>Сайт добавлен!</b>\n\n"
             f"Название: {site.name}\n"
             f"URL: {site.url}\n"
             f"Поддержка: {site.support_level}\n"
             f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: {', '.join(str(u) for u in notify_users)}",
+            f"Подписчики: {', '.join(str(u) for u in notify_users)}\n\n"
+            f"⏳ Проверяю...",
+            parse_mode="HTML"
+        )
+        # Немедленная проверка
+        check_result = await _check_new_site(site)
+        await status_msg.edit_text(
+            f"✅ <b>Сайт добавлен!</b>\n\n"
+            f"Название: {site.name}\n"
+            f"URL: {site.url}\n"
+            f"Поддержка: {site.support_level}\n"
+            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
+            f"Подписчики: {', '.join(str(u) for u in notify_users)}\n\n"
+            f"<b>Первая проверка:</b> {check_result}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
