@@ -43,7 +43,6 @@ class AddSiteStates(StatesGroup):
     """Состояния для добавления сайта."""
     waiting_for_url = State()
     waiting_for_support_level = State()
-    waiting_for_expected_code = State()
     waiting_for_keywords = State()
     waiting_for_notify_users = State()
 
@@ -1707,8 +1706,8 @@ async def cmd_add_site(event, state: FSMContext) -> None:
 
     text = (
         "➕ <b>Добавление нового сайта</b>\n\n"
-        "Шаг 1/5: Введите URL сайта\n\n"
-        "Пример: <code>https://example.com</code>"
+        "Шаг 1/3: Введите URL сайта\n\n"
+        "Пример: <code>example.com</code>"
     )
 
     if isinstance(event, CallbackQuery):
@@ -1748,7 +1747,7 @@ async def process_site_url(message: Message, state: FSMContext) -> None:
 
     await message.answer(
         f"✅ Сайт: <b>{domain}</b>\n\n"
-        "Шаг 2/5: Выберите уровень поддержки",
+        "Выберите уровень поддержки:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -1769,52 +1768,46 @@ async def process_new_support(callback: CallbackQuery, state: FSMContext) -> Non
     new_site = data.get("new_site", {})
     new_site["support_level"] = level
     await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_expected_code)
+    await state.set_state(AddSiteStates.waiting_for_keywords)
 
     await callback.message.edit_text(
         f"✅ Уровень поддержки: {level}\n\n"
-        "Шаг 3/5: Введите ожидаемый HTTP код\n\n"
-        "Пример: <code>200</code>",
-        parse_mode="HTML"
+        "Шаг 2/3: Введите ключевые слова через запятую\n\n"
+        "Пример: <code>Welcome, Главная</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_keywords")]
+        ])
     )
     await callback.answer()
 
 
-@router.message(StateFilter(AddSiteStates.waiting_for_expected_code))
-async def process_expected_code(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода ожидаемого HTTP кода."""
-    try:
-        code = int(message.text.strip())
-        if code < 100 or code > 599:
-            raise ValueError()
-    except ValueError:
-        await message.answer("❌ Введите корректный HTTP код (100-599)")
-        return
-
+@router.callback_query(F.data == "new_skip_keywords", StateFilter(AddSiteStates.waiting_for_keywords))
+async def callback_skip_keywords(callback: CallbackQuery, state: FSMContext) -> None:
+    """Пропуск ключевых слов."""
     data = await state.get_data()
     new_site = data.get("new_site", {})
-    new_site["expected_code"] = code
+    new_site["keywords"] = []
     await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_keywords)
+    await state.set_state(AddSiteStates.waiting_for_notify_users)
 
-    await message.answer(
-        f"✅ Ожидаемый код: {code}\n\n"
-        "Шаг 4/5: Введите ключевые слова через запятую\n"
-        "(или отправьте <code>-</code> чтобы пропустить)\n\n"
-        "Пример: <code>Welcome, Home, Login</code>",
-        parse_mode="HTML"
+    await callback.message.edit_text(
+        "✅ Ключевые слова: —\n\n"
+        "Шаг 3/3: Введите Telegram ID для уведомлений\n\n"
+        "Пример: <code>123456789</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_notify")]
+        ])
     )
+    await callback.answer()
 
 
 @router.message(StateFilter(AddSiteStates.waiting_for_keywords))
 async def process_keywords(message: Message, state: FSMContext) -> None:
     """Обработчик ввода ключевых слов."""
     text = message.text.strip()
-
-    if text == "-":
-        keywords = []
-    else:
-        keywords = [k.strip() for k in text.split(",") if k.strip()]
+    keywords = [k.strip() for k in text.split(",") if k.strip()]
 
     data = await state.get_data()
     new_site = data.get("new_site", {})
@@ -1822,33 +1815,23 @@ async def process_keywords(message: Message, state: FSMContext) -> None:
     await state.update_data(new_site=new_site)
     await state.set_state(AddSiteStates.waiting_for_notify_users)
 
-    keywords_str = ", ".join(keywords) if keywords else "—"
+    keywords_str = ", ".join(keywords)
     await message.answer(
         f"✅ Ключевые слова: {keywords_str}\n\n"
-        "Шаг 5/5: Введите Telegram ID пользователей для уведомлений\n"
-        "(через запятую или <code>-</code> чтобы пропустить)\n\n"
-        "Пример: <code>123456789, 987654321</code>",
-        parse_mode="HTML"
+        "Шаг 3/3: Введите Telegram ID для уведомлений\n\n"
+        "Пример: <code>123456789</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_notify")]
+        ])
     )
 
 
-@router.message(StateFilter(AddSiteStates.waiting_for_notify_users))
-async def process_notify_users(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода пользователей для уведомлений."""
-    text = message.text.strip()
-
-    if text == "-":
-        notify_users = []
-    else:
-        try:
-            notify_users = [int(u.strip()) for u in text.split(",") if u.strip()]
-        except ValueError:
-            await message.answer("❌ Введите числовые Telegram ID через запятую")
-            return
-
+@router.callback_query(F.data == "new_skip_notify", StateFilter(AddSiteStates.waiting_for_notify_users))
+async def callback_skip_notify(callback: CallbackQuery, state: FSMContext) -> None:
+    """Пропуск подписчиков — завершение добавления."""
     data = await state.get_data()
     new_site = data.get("new_site", {})
-    new_site["notify_users"] = notify_users
 
     site = SiteConfig(
         id=new_site["id"],
@@ -1857,7 +1840,57 @@ async def process_notify_users(message: Message, state: FSMContext) -> None:
         support_level=new_site.get("support_level", "none"),
         check_ssl=True,
         check_http_code=True,
-        expected_code=new_site.get("expected_code", 200),
+        expected_code=200,
+        keywords=new_site.get("keywords", []),
+        notify_users=[]
+    )
+
+    if add_site(_config, site, _config_path):
+        await callback.message.edit_text(
+            f"✅ <b>Сайт добавлен!</b>\n\n"
+            f"Название: {site.name}\n"
+            f"URL: {site.url}\n"
+            f"Поддержка: {site.support_level}\n"
+            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
+            f"Подписчики: —",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
+        )
+    else:
+        await callback.message.edit_text("❌ Ошибка при добавлении сайта")
+
+    await state.clear()
+    await callback.answer()
+
+
+@router.message(StateFilter(AddSiteStates.waiting_for_notify_users))
+async def process_notify_users(message: Message, state: FSMContext) -> None:
+    """Обработчик ввода пользователей для уведомлений."""
+    text = message.text.strip()
+
+    try:
+        notify_users = [int(u.strip()) for u in text.split(",") if u.strip()]
+    except ValueError:
+        await message.answer("❌ Введите числовые Telegram ID через запятую")
+        return
+
+    if not notify_users:
+        await message.answer("❌ Введите хотя бы один Telegram ID")
+        return
+
+    data = await state.get_data()
+    new_site = data.get("new_site", {})
+
+    site = SiteConfig(
+        id=new_site["id"],
+        name=new_site["name"],
+        url=new_site["url"],
+        support_level=new_site.get("support_level", "none"),
+        check_ssl=True,
+        check_http_code=True,
+        expected_code=200,
         keywords=new_site.get("keywords", []),
         notify_users=notify_users
     )
@@ -1866,13 +1899,16 @@ async def process_notify_users(message: Message, state: FSMContext) -> None:
 
     if success:
         await message.answer(
-            f"✅ <b>Сайт успешно добавлен!</b>\n\n"
-            f"🆔 ID: {site.id}\n"
-            f"📝 Название: {site.name}\n"
-            f"🔗 URL: {site.url}\n"
-            f"⭐ Поддержка: {site.support_level}",
+            f"✅ <b>Сайт добавлен!</b>\n\n"
+            f"Название: {site.name}\n"
+            f"URL: {site.url}\n"
+            f"Поддержка: {site.support_level}\n"
+            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
+            f"Подписчики: {', '.join(str(u) for u in notify_users)}",
             parse_mode="HTML",
-            reply_markup=_site_info_keyboard(site.id, message.from_user.id)
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
         )
     else:
         await message.answer("❌ Не удалось добавить сайт")
