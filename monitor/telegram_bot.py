@@ -273,6 +273,7 @@ def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="menu_check_now")],
             [InlineKeyboardButton(text="⚙️ Управление сайтами", callback_data="sites_list")],
             [InlineKeyboardButton(text="➕ Добавить сайт", callback_data="add_site")],
+            [InlineKeyboardButton(text="👑 Администраторы", callback_data="menu_admins")],
         ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -672,7 +673,14 @@ async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> 
         return
 
     user_id = callback.from_user.id
-    sites = get_sites_for_user(_config, user_id)
+
+    # Админы видят все сайты
+    if _is_admin(user_id):
+        sites = _config.sites
+        title = "📋 <b>Все сайты:</b>\n"
+    else:
+        sites = get_sites_for_user(_config, user_id)
+        title = "📋 <b>Мои сайты:</b>\n"
 
     if not sites:
         await callback.message.edit_text(
@@ -687,7 +695,7 @@ async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer()
         return
 
-    lines = ["📋 <b>Мои сайты:</b>\n"]
+    lines = [title]
     for site in sites:
         site_state = _database.get_state(site.id) if _database else None
         status_emoji = "🟢" if (site_state and site_state.status == "UP") else "🔴"
@@ -758,6 +766,138 @@ async def callback_menu_muted(callback: CallbackQuery, state: FSMContext) -> Non
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu_admins")
+async def callback_menu_admins(callback: CallbackQuery, state: FSMContext) -> None:
+    """Управление администраторами через меню."""
+    await state.clear()
+    user_id = callback.from_user.id
+
+    if not _is_admin(user_id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    if _config is None:
+        await callback.answer("❌ Конфигурация не загружена", show_alert=True)
+        return
+
+    lines = ["👑 <b>Администраторы:</b>\n"]
+    buttons = []
+
+    for admin_id in _config.telegram.admin_ids:
+        # Получаем информацию из базы
+        user_info = _database.get_user(admin_id) if _database else None
+        if user_info:
+            name = user_info.full_name or user_info.username or str(admin_id)
+            lines.append(f"• {name} (<code>{admin_id}</code>)")
+        else:
+            lines.append(f"• <code>{admin_id}</code>")
+
+        # Кнопка удаления (кроме себя и если админов больше 1)
+        if admin_id != user_id and len(_config.telegram.admin_ids) > 1:
+            btn_name = user_info.full_name[:15] if user_info and user_info.full_name else str(admin_id)
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"❌ Удалить {btn_name}",
+                    callback_data=f"remove_admin:{admin_id}"
+                )
+            ])
+
+    lines.append(f"\nВсего: {len(_config.telegram.admin_ids)}")
+
+    buttons.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin_start")])
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("remove_admin:"))
+async def callback_remove_admin(callback: CallbackQuery) -> None:
+    """Удаление администратора через меню."""
+    user_id = callback.from_user.id
+
+    if not _is_admin(user_id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    admin_to_remove = int(callback.data.split(":")[1])
+
+    if remove_admin(_config, admin_to_remove, _config_path):
+        await callback.answer("✅ Администратор удалён", show_alert=True)
+        # Обновляем список
+        await callback_menu_admins(callback, None)
+    else:
+        await callback.answer("❌ Не удалось удалить", show_alert=True)
+
+
+class AddAdminStates(StatesGroup):
+    """Состояния для добавления админа."""
+    waiting_for_id = State()
+
+
+@router.callback_query(F.data == "add_admin_start")
+async def callback_add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало добавления администратора."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
+        return
+
+    await state.set_state(AddAdminStates.waiting_for_id)
+
+    await callback.message.edit_text(
+        "👑 <b>Добавление администратора</b>\n\n"
+        "Введите Telegram ID нового администратора:\n\n"
+        "<i>Пользователь может узнать свой ID через /myid</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_admins")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(AddAdminStates.waiting_for_id))
+async def process_add_admin_id(message: Message, state: FSMContext) -> None:
+    """Обработчик ввода ID нового админа."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("❌ Только для администраторов")
+        return
+
+    try:
+        new_admin_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:")
+        return
+
+    if new_admin_id in _config.telegram.admin_ids:
+        await message.answer("ℹ️ Этот пользователь уже администратор")
+        await state.clear()
+        return
+
+    if add_admin(_config, new_admin_id, _config_path):
+        user_info = _database.get_user(new_admin_id) if _database else None
+        name = ""
+        if user_info:
+            name = f" ({user_info.full_name or user_info.username})"
+
+        await message.answer(
+            f"✅ Администратор добавлен: <code>{new_admin_id}</code>{name}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👑 К списку админов", callback_data="menu_admins")],
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
+        )
+    else:
+        await message.answer("❌ Не удалось добавить администратора")
+
+    await state.clear()
 
 
 @router.callback_query(F.data == "menu_status_all")
