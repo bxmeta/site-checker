@@ -109,6 +109,13 @@ class TelegramNotifier:
             ]
         ])
 
+    def _get_all_recipients(self, site: SiteConfig, user_ids: Optional[List[int]] = None) -> List[int]:
+        """Возвращает список всех получателей: подписчики + админы (без дубликатов)."""
+        base_users = user_ids if user_ids is not None else site.notify_users
+        all_recipients = set(base_users)
+        all_recipients.update(self.admin_ids)
+        return list(all_recipients)
+
     async def notify_site_down(
         self,
         site: SiteConfig,
@@ -123,7 +130,7 @@ class TelegramNotifier:
             check_result: Результат проверки
             user_ids: Список ID пользователей для уведомления
         """
-        recipients = user_ids or site.notify_users
+        recipients = self._get_all_recipients(site, user_ids)
         message = self._format_down_message(site, check_result)
         keyboard = self._create_down_keyboard(site.id)
 
@@ -150,7 +157,7 @@ class TelegramNotifier:
             user_ids: Список ID пользователей для уведомления
             downtime_seconds: Время простоя в секундах
         """
-        recipients = user_ids or site.notify_users
+        recipients = self._get_all_recipients(site, user_ids)
         message = self._format_up_message(site, check_result, downtime_seconds)
 
         for user_id in recipients:
@@ -185,7 +192,11 @@ class TelegramNotifier:
         )
         keyboard = self._create_down_keyboard(site.id)
 
-        for user_id in user_ids:
+        # Объединяем подписчиков и админов
+        all_recipients = set(user_ids)
+        all_recipients.update(self.admin_ids)
+
+        for user_id in all_recipients:
             if user_id in muted_users:
                 logger.debug(f"[{site.id}] Пропуск напоминания для {user_id} (заглушено)")
                 continue
