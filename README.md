@@ -145,6 +145,8 @@ WorkingDirectory=/path/to/site-checker
 ExecStart=/usr/bin/python3 /path/to/site-checker/main.py
 Restart=always
 RestartSec=10
+TimeoutStartSec=10
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
