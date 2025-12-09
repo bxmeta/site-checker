@@ -279,7 +279,8 @@ class Database:
         new_fail_streak = state.fail_streak + 1
 
         with self._get_connection() as conn:
-            if old_status == "UP" and new_fail_streak >= retry_count:
+            # Если все retry провалились — сразу DOWN (retry_count=1 означает немедленно)
+            if old_status == "UP" and new_fail_streak >= 1:
                 # Создаём инцидент
                 incident_id = self._create_incident(
                     conn, site_id, error_type, error_message
