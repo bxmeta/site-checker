@@ -2,27 +2,36 @@
 Главная точка входа приложения мониторинга сайтов.
 """
 import asyncio
+import os
 import sys
 import signal
 from typing import Optional
 
 from monitor.config_loader import load_config
-from monitor.state_manager import StateManager
+from monitor.database import Database
 from monitor.notifier import TelegramNotifier
 from monitor.scheduler import MonitorScheduler
 from monitor.telegram_bot import setup_bot, start_bot, start_bot_webhook, run_webhook_server
 from monitor.logger import setup_logger
 
+# Базовая директория приложения (где лежит main.py)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 async def main() -> None:
     """Главная асинхронная функция приложения."""
-    logger = setup_logger("monitor.log")
+    logger = setup_logger(os.path.join(BASE_DIR, "monitor.log"))
     logger.info("=" * 50)
     logger.info("Запуск системы мониторинга сайтов")
     logger.info("=" * 50)
 
+    config_path = os.path.join(BASE_DIR, "config.yaml")
+    db_path = os.path.join(BASE_DIR, "monitor.db")
+    state_path = os.path.join(BASE_DIR, "state.json")
+    users_path = os.path.join(BASE_DIR, "users.json")
+
     try:
-        config = load_config("config.yaml")
+        config = load_config(config_path)
         logger.info(f"Конфигурация загружена: {len(config.sites)} сайтов")
     except FileNotFoundError as e:
         logger.error(f"Файл конфигурации не найден: {e}")
@@ -31,15 +40,20 @@ async def main() -> None:
         logger.error(f"Ошибка в конфигурации: {e}")
         sys.exit(1)
 
-    state_manager = StateManager("state.json")
-    logger.info("Менеджер состояния инициализирован")
+    database = Database(db_path)
+    logger.info("База данных инициализирована")
+
+    # Миграция из старых JSON-файлов (если есть)
+    migrated_sites, migrated_users = database.migrate_from_json(state_path, users_path)
+    if migrated_sites or migrated_users:
+        logger.info(f"Мигрировано: {migrated_sites} сайтов, {migrated_users} пользователей")
 
     notifier = TelegramNotifier(config.telegram)
     logger.info("Telegram-нотификатор инициализирован")
 
-    scheduler = MonitorScheduler(config, state_manager, notifier)
+    scheduler = MonitorScheduler(config, database, notifier)
 
-    bot, dp = setup_bot(config, state_manager, notifier, "users.json")
+    bot, dp = setup_bot(config, database, notifier, scheduler, config_path)
     logger.info("Telegram-бот настроен")
 
     scheduler_task: Optional[asyncio.Task] = None

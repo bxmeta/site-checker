@@ -219,7 +219,7 @@ journalctl -u site-monitor -f
 ├── monitor/
 │   ├── __init__.py
 │   ├── config_loader.py     # Загрузка конфигурации
-│   ├── state_manager.py     # Управление состоянием
+│   ├── database.py          # SQLite база данных
 │   ├── checker.py           # HTTP-проверки
 │   ├── ssl_checker.py       # SSL-проверки
 │   ├── keyword_checker.py   # Поиск ключевых слов
@@ -231,8 +231,7 @@ journalctl -u site-monitor -f
 │   └── time_utils.py        # Работа с временем
 ├── main.py                  # Точка входа
 ├── config.yaml              # Конфигурация
-├── state.json               # Состояние сайтов
-├── users.json               # Зарегистрированные пользователи
+├── monitor.db               # SQLite база данных (создаётся автоматически)
 ├── monitor.log              # Файл логов
 ├── requirements.txt         # Зависимости
 └── README.md

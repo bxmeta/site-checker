@@ -1,9 +1,8 @@
 """
 Telegram-бот для управления мониторингом.
 """
-import json
+import asyncio
 import logging
-import os
 import re
 from typing import Optional
 
@@ -23,18 +22,19 @@ from .config_loader import (
     Config, SiteConfig, get_sites_for_user, get_site_by_id,
     add_site, remove_site, update_site, add_notify_user, remove_notify_user
 )
-from .state_manager import StateManager
-from .notifier import TelegramNotifier
-from .scheduler import run_immediate_check
+from .database import Database
+from .notifier import TelegramNotifier, format_duration
+from .scheduler import run_immediate_check, MonitorScheduler
+from .time_utils import parse_datetime, now_izhevsk
 
 logger = logging.getLogger("site_monitor")
 
 router = Router()
 
 _config: Optional[Config] = None
-_state_manager: Optional[StateManager] = None
+_database: Optional[Database] = None
 _notifier: Optional[TelegramNotifier] = None
-_users_file: str = "users.json"
+_scheduler: Optional[MonitorScheduler] = None
 _config_path: str = "config.yaml"
 
 
@@ -53,23 +53,6 @@ class EditSiteStates(StatesGroup):
     """Состояния для редактирования сайта."""
     waiting_for_field = State()
     waiting_for_value = State()
-
-
-def _load_users() -> dict:
-    """Загружает список зарегистрированных пользователей."""
-    if not os.path.exists(_users_file):
-        return {}
-    try:
-        with open(_users_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-
-def _save_users(users: dict) -> None:
-    """Сохраняет список зарегистрированных пользователей."""
-    with open(_users_file, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
 
 
 def _is_admin(user_id: int) -> bool:
@@ -91,7 +74,7 @@ def _sites_list_keyboard(page: int = 0, items_per_page: int = 5) -> InlineKeyboa
 
     buttons = []
     for site in sites[start_idx:end_idx]:
-        state = _state_manager.get_state(site.id) if _state_manager else None
+        state = _database.get_state(site.id) if _database else None
         status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
         buttons.append([
             InlineKeyboardButton(
@@ -115,7 +98,7 @@ def _sites_list_keyboard(page: int = 0, items_per_page: int = 5) -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _site_info_keyboard(site_id: str) -> InlineKeyboardMarkup:
+def _site_info_keyboard(site_id: str, user_id: int = 0) -> InlineKeyboardMarkup:
     """Создаёт клавиатуру для управления сайтом."""
     buttons = [
         [
@@ -124,10 +107,34 @@ def _site_info_keyboard(site_id: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👥 Подписчики", callback_data=f"site_users:{site_id}"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data=f"site_stats:{site_id}")
+        ],
+        [
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_site:{site_id}")
         ],
-        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data="sites_list")]
     ]
+
+    # Добавляем кнопку mute/unmute если сайт DOWN
+    if _database:
+        state = _database.get_state(site_id)
+        if state.status == "DOWN" and user_id:
+            is_muted = _database.is_muted(user_id, site_id)
+            if is_muted:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text="🔔 Включить напоминания",
+                        callback_data=f"unmute_site:{site_id}"
+                    )
+                ])
+            else:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text="🔇 Заглушить напоминания",
+                        callback_data=f"mute_site:{site_id}"
+                    )
+                ])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="sites_list")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -229,6 +236,17 @@ def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Мои сайты", callback_data="menu_my_sites")],
     ]
 
+    # Добавляем кнопку "Мои заглушки" если есть
+    if _database:
+        muted = _database.get_user_mutes(user_id)
+        if muted:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔇 Заглушенные ({len(muted)})",
+                    callback_data="menu_muted"
+                )
+            ])
+
     if _is_admin(user_id):
         buttons.extend([
             [InlineKeyboardButton(text="📊 Статус всех сайтов", callback_data="menu_status_all")],
@@ -240,22 +258,20 @@ def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+# ==================== Команды ====================
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     """Обработчик команды /start."""
     user_id = message.from_user.id
-    username = message.from_user.username or "Неизвестно"
-    full_name = message.from_user.full_name or "Неизвестно"
+    username = message.from_user.username
+    full_name = message.from_user.full_name or "Пользователь"
 
-    users = _load_users()
-    if str(user_id) not in users:
-        users[str(user_id)] = {
-            "username": username,
-            "full_name": full_name,
-            "registered_at": str(message.date)
-        }
-        _save_users(users)
-        logger.info(f"Новый пользователь зарегистрирован: {user_id} (@{username})")
+    # Регистрируем пользователя в базе
+    if _database:
+        is_new = _database.register_user(user_id, username, full_name)
+        if is_new:
+            logger.info(f"Новый пользователь зарегистрирован: {user_id} (@{username})")
 
     role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
 
@@ -269,10 +285,202 @@ async def cmd_start(message: Message) -> None:
     )
 
 
+@router.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    """Обработчик команды /myid."""
+    user_id = message.from_user.id
+    await message.answer(
+        f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("my_sites"))
+async def cmd_my_sites(message: Message) -> None:
+    """Обработчик команды /my_sites."""
+    if _config is None:
+        await message.answer("❌ Конфигурация не загружена")
+        return
+
+    user_id = message.from_user.id
+    sites = get_sites_for_user(_config, user_id)
+
+    if not sites:
+        await message.answer(
+            "📋 Вы не подписаны на уведомления ни одного сайта.\n\n"
+            "Попросите администратора добавить ваш ID в notify_users для нужных сайтов."
+        )
+        return
+
+    lines = ["📋 <b>Ваши сайты:</b>\n"]
+    for site in sites:
+        state = _database.get_state(site.id) if _database else None
+        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
+        status_text = state.status if state else "N/A"
+
+        lines.append(
+            f"{status_emoji} <b>{site.name}</b>\n"
+            f"   URL: {site.url}\n"
+            f"   Статус: {status_text}\n"
+            f"   Поддержка: {site.support_level}\n"
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("status_all"))
+async def cmd_status_all(message: Message) -> None:
+    """Обработчик команды /status_all (только админы)."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None or _database is None:
+        await message.answer("❌ Конфигурация или состояние не загружены")
+        return
+
+    lines = ["📊 <b>Статус всех сайтов:</b>\n"]
+
+    for site in _config.sites:
+        state = _database.get_state(site.id)
+        status_emoji = "🟢" if state.status == "UP" else "🔴"
+
+        lines.append(
+            f"{status_emoji} <b>{site.name}</b> ({site.id})\n"
+            f"   URL: {site.url}\n"
+            f"   Статус: {state.status}\n"
+            f"   Неудачных проверок подряд: {state.fail_streak}\n"
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("check_now"))
+async def cmd_check_now(message: Message) -> None:
+    """Обработчик команды /check_now (только админы)."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None or _database is None or _notifier is None:
+        await message.answer("❌ Система не полностью инициализирована")
+        return
+
+    await message.answer("⏳ Запускаю проверку всех сайтов...")
+
+    try:
+        report = await run_immediate_check(_config, _database, _notifier)
+        await message.answer(
+            f"📋 <b>Результаты проверки:</b>\n\n{report}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при мгновенной проверке: {e}")
+        await message.answer(f"❌ Ошибка при проверке: {e}")
+
+
+@router.message(Command("sites"))
+async def cmd_sites(message: Message) -> None:
+    """Обработчик команды /sites (только админы)."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None:
+        await message.answer("❌ Конфигурация не загружена")
+        return
+
+    await message.answer(
+        "📋 <b>Управление сайтами</b>\n\n"
+        f"Всего сайтов: {len(_config.sites)}",
+        parse_mode="HTML",
+        reply_markup=_sites_list_keyboard()
+    )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Обработчик команды /stats (только админы)."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None or _database is None:
+        await message.answer("❌ Система не инициализирована")
+        return
+
+    # Показываем список сайтов для выбора
+    buttons = []
+    for site in _config.sites:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📊 {site.name}",
+                callback_data=f"site_stats:{site.id}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
+
+    await message.answer(
+        "📊 <b>Статистика сайтов</b>\n\n"
+        "Выберите сайт для просмотра статистики:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.message(Command("muted"))
+async def cmd_muted(message: Message) -> None:
+    """Обработчик команды /muted - список заглушенных сайтов."""
+    user_id = message.from_user.id
+
+    if _database is None or _config is None:
+        await message.answer("❌ Система не инициализирована")
+        return
+
+    muted_sites = _database.get_user_mutes(user_id)
+
+    if not muted_sites:
+        await message.answer("🔔 У вас нет заглушенных сайтов.")
+        return
+
+    lines = ["🔇 <b>Заглушенные сайты:</b>\n"]
+    buttons = []
+
+    for site_id in muted_sites:
+        site = get_site_by_id(_config, site_id)
+        if site:
+            lines.append(f"• {site.name}")
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔔 Включить {site.name}",
+                    callback_data=f"unmute_site:{site_id}"
+                )
+            ])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+# ==================== Callback handlers для меню ====================
+
 @router.callback_query(F.data == "menu_main")
 async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
     """Возврат в главное меню."""
-    await state.clear()  # Сбрасываем любое ожидание ввода
+    await state.clear()
 
     user_id = callback.from_user.id
     full_name = callback.from_user.full_name or "Пользователь"
@@ -331,12 +539,18 @@ async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> 
 
     lines = ["📋 <b>Мои сайты:</b>\n"]
     for site in sites:
-        state = _state_manager.get_state(site.id) if _state_manager else None
-        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
-        status_text = state.status if state else "N/A"
+        site_state = _database.get_state(site.id) if _database else None
+        status_emoji = "🟢" if (site_state and site_state.status == "UP") else "🔴"
+        status_text = site_state.status if site_state else "N/A"
+
+        # Проверяем, заглушен ли сайт
+        muted_str = ""
+        if _database and site_state and site_state.status == "DOWN":
+            if _database.is_muted(user_id, site.id):
+                muted_str = " 🔇"
 
         lines.append(
-            f"{status_emoji} <b>{site.name}</b>\n"
+            f"{status_emoji} <b>{site.name}</b>{muted_str}\n"
             f"   Статус: {status_text} | Поддержка: {site.support_level}\n"
         )
 
@@ -350,6 +564,52 @@ async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
+@router.callback_query(F.data == "menu_muted")
+async def callback_menu_muted(callback: CallbackQuery, state: FSMContext) -> None:
+    """Список заглушенных сайтов через меню."""
+    await state.clear()
+    user_id = callback.from_user.id
+
+    if _database is None or _config is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
+        return
+
+    muted_sites = _database.get_user_mutes(user_id)
+
+    if not muted_sites:
+        await callback.message.edit_text(
+            "🔔 У вас нет заглушенных сайтов.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    lines = ["🔇 <b>Заглушенные сайты:</b>\n"]
+    buttons = []
+
+    for site_id in muted_sites:
+        site = get_site_by_id(_config, site_id)
+        if site:
+            lines.append(f"• {site.name}")
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔔 Включить {site.name}",
+                    callback_data=f"unmute_site:{site_id}"
+                )
+            ])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "menu_status_all")
 async def callback_menu_status_all(callback: CallbackQuery, state: FSMContext) -> None:
     """Статус всех сайтов через меню."""
@@ -358,19 +618,19 @@ async def callback_menu_status_all(callback: CallbackQuery, state: FSMContext) -
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
 
-    if _config is None or _state_manager is None:
+    if _config is None or _database is None:
         await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
     lines = ["📊 <b>Статус всех сайтов:</b>\n"]
 
     for site in _config.sites:
-        state = _state_manager.get_state(site.id)
-        status_emoji = "🟢" if state.status == "UP" else "🔴"
+        site_state = _database.get_state(site.id)
+        status_emoji = "🟢" if site_state.status == "UP" else "🔴"
 
         lines.append(
             f"{status_emoji} <b>{site.name}</b>\n"
-            f"   Статус: {state.status} | Ошибок подряд: {state.fail_streak}\n"
+            f"   Статус: {site_state.status} | Ошибок подряд: {site_state.fail_streak}\n"
         )
 
     await callback.message.edit_text(
@@ -392,14 +652,14 @@ async def callback_menu_check_now(callback: CallbackQuery, state: FSMContext) ->
         await callback.answer("❌ Только для администраторов", show_alert=True)
         return
 
-    if _config is None or _state_manager is None or _notifier is None:
+    if _config is None or _database is None or _notifier is None:
         await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
     await callback.answer("⏳ Запускаю проверку...")
 
     try:
-        report = await run_immediate_check(_config, _state_manager, _notifier)
+        report = await run_immediate_check(_config, _database, _notifier)
         await callback.message.edit_text(
             f"📋 <b>Результаты проверки:</b>\n\n{report}",
             parse_mode="HTML",
@@ -413,124 +673,145 @@ async def callback_menu_check_now(callback: CallbackQuery, state: FSMContext) ->
         await callback.message.answer(f"❌ Ошибка: {e}")
 
 
-@router.message(Command("myid"))
-async def cmd_myid(message: Message) -> None:
-    """Обработчик команды /myid."""
-    user_id = message.from_user.id
-    await message.answer(
-        f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
-        parse_mode="HTML"
-    )
+# ==================== Mute/Unmute handlers ====================
 
+@router.callback_query(F.data.startswith("mute_site:"))
+async def callback_mute_site(callback: CallbackQuery) -> None:
+    """Обработчик заглушения напоминаний."""
+    user_id = callback.from_user.id
+    site_id = callback.data.split(":")[1]
 
-@router.message(Command("my_sites"))
-async def cmd_my_sites(message: Message) -> None:
-    """Обработчик команды /my_sites."""
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
+    if _database is None or _config is None or _notifier is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
-    user_id = message.from_user.id
-    sites = get_sites_for_user(_config, user_id)
-
-    if not sites:
-        await message.answer(
-            "📋 Вы не подписаны на уведомления ни одного сайта.\n\n"
-            "Попросите администратора добавить ваш ID в notify_users для нужных сайтов."
-        )
+    site = get_site_by_id(_config, site_id)
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
         return
 
-    lines = ["📋 <b>Ваши сайты:</b>\n"]
-    for site in sites:
-        state = _state_manager.get_state(site.id) if _state_manager else None
-        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
-        status_text = state.status if state else "N/A"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b>\n"
-            f"   URL: {site.url}\n"
-            f"   Статус: {status_text}\n"
-            f"   Поддержка: {site.support_level}\n"
-        )
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("status_all"))
-async def cmd_status_all(message: Message) -> None:
-    """Обработчик команды /status_all (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+    # Проверяем, что сайт действительно DOWN
+    state = _database.get_state(site_id)
+    if state.status != "DOWN":
+        await callback.answer("ℹ️ Сайт уже восстановлен", show_alert=True)
         return
 
-    if _config is None or _state_manager is None:
-        await message.answer("❌ Конфигурация или состояние не загружены")
+    success = _database.mute_for_user(user_id, site_id)
+
+    if success:
+        await _notifier.send_mute_confirmation(user_id, site.name, site_id)
+        await callback.answer("🔇 Напоминания отключены")
+    else:
+        await callback.answer("ℹ️ Уже заглушено", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unmute_site:"))
+async def callback_unmute_site(callback: CallbackQuery) -> None:
+    """Обработчик включения напоминаний."""
+    user_id = callback.from_user.id
+    site_id = callback.data.split(":")[1]
+
+    if _database is None or _config is None or _notifier is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
-    lines = ["📊 <b>Статус всех сайтов:</b>\n"]
-
-    for site in _config.sites:
-        state = _state_manager.get_state(site.id)
-        status_emoji = "🟢" if state.status == "UP" else "🔴"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b> ({site.id})\n"
-            f"   URL: {site.url}\n"
-            f"   Статус: {state.status}\n"
-            f"   Неудачных проверок подряд: {state.fail_streak}\n"
-        )
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("check_now"))
-async def cmd_check_now(message: Message) -> None:
-    """Обработчик команды /check_now (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+    site = get_site_by_id(_config, site_id)
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
         return
 
-    if _config is None or _state_manager is None or _notifier is None:
-        await message.answer("❌ Система не полностью инициализирована")
+    success = _database.unmute_for_user(user_id, site_id)
+
+    if success:
+        await _notifier.send_unmute_confirmation(user_id, site.name)
+        await callback.answer("🔔 Напоминания включены")
+    else:
+        await callback.answer("ℹ️ Не было заглушено", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("check_now:"))
+async def callback_check_now_single(callback: CallbackQuery) -> None:
+    """Обработчик мгновенной проверки из уведомления."""
+    site_id = callback.data.split(":")[1]
+
+    if _scheduler is None or _config is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
-    await message.answer("⏳ Запускаю проверку всех сайтов...")
+    site = get_site_by_id(_config, site_id)
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
+        return
 
-    try:
-        report = await run_immediate_check(_config, _state_manager, _notifier)
-        await message.answer(
-            f"📋 <b>Результаты проверки:</b>\n\n{report}",
+    await callback.answer("⏳ Проверяю...")
+
+    result = await _scheduler.check_single_site(site_id)
+
+    if result:
+        await callback.message.answer(
+            f"🔍 <b>Результат проверки</b>\n\n{result}",
             parse_mode="HTML"
         )
-    except Exception as e:
-        logger.error(f"Ошибка при мгновенной проверке: {e}")
-        await message.answer(f"❌ Ошибка при проверке: {e}")
+    else:
+        await callback.message.answer("❌ Не удалось выполнить проверку")
 
 
-@router.message(Command("sites"))
-async def cmd_sites(message: Message) -> None:
-    """Обработчик команды /sites (только админы)."""
-    user_id = message.from_user.id
+# ==================== Статистика ====================
 
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+@router.callback_query(F.data.startswith("site_stats:"))
+async def callback_site_stats(callback: CallbackQuery) -> None:
+    """Обработчик просмотра статистики сайта."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("❌ Только для администраторов", show_alert=True)
         return
 
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
+    site_id = callback.data.split(":")[1]
+
+    if _database is None or _config is None:
+        await callback.answer("❌ Система не инициализирована", show_alert=True)
         return
 
-    await message.answer(
-        "📋 <b>Управление сайтами</b>\n\n"
-        f"Всего сайтов: {len(_config.sites)}",
-        parse_mode="HTML",
-        reply_markup=_sites_list_keyboard()
+    site = get_site_by_id(_config, site_id)
+    if not site:
+        await callback.answer("❌ Сайт не найден", show_alert=True)
+        return
+
+    stats = _database.get_site_stats(site_id)
+
+    # Форматируем последний инцидент
+    last_incident_str = "—"
+    if stats.last_incident_at:
+        last_dt = parse_datetime(stats.last_incident_at)
+        delta = now_izhevsk() - last_dt
+        if delta.days > 0:
+            last_incident_str = f"{delta.days} дн. назад"
+        elif delta.seconds > 3600:
+            last_incident_str = f"{delta.seconds // 3600} ч. назад"
+        else:
+            last_incident_str = f"{delta.seconds // 60} мин. назад"
+
+    text = (
+        f"📊 <b>Статистика сайта {site.name}</b>\n\n"
+        f"Uptime за 7 дней: <b>{stats.uptime_7d}%</b>\n"
+        f"Uptime за 30 дней: <b>{stats.uptime_30d}%</b>\n"
+        f"Инцидентов за 30 дней: <b>{stats.incidents_30d}</b>\n"
+        f"Среднее время простоя: <b>{format_duration(stats.avg_downtime_seconds)}</b>\n"
+        f"Последний инцидент: <b>{last_incident_str}</b>"
     )
 
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"site_stats:{site_id}")],
+            [InlineKeyboardButton(text="◀️ К сайту", callback_data=f"site_info:{site_id}")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
+        ])
+    )
+    await callback.answer()
+
+
+# ==================== Управление сайтами ====================
 
 @router.callback_query(F.data == "sites_list")
 async def callback_sites_list(callback: CallbackQuery, state: FSMContext) -> None:
@@ -576,9 +857,9 @@ async def callback_site_info(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("❌ Сайт не найден", show_alert=True)
         return
 
-    state = _state_manager.get_state(site_id) if _state_manager else None
-    status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
-    status_text = state.status if state else "N/A"
+    site_state = _database.get_state(site_id) if _database else None
+    status_emoji = "🟢" if (site_state and site_state.status == "UP") else "🔴"
+    status_text = site_state.status if site_state else "N/A"
 
     ssl_status = "✅" if site.check_ssl else "❌"
     http_status = "✅" if site.check_http_code else "❌"
@@ -601,7 +882,7 @@ async def callback_site_info(callback: CallbackQuery, state: FSMContext) -> None
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=_site_info_keyboard(site_id)
+        reply_markup=_site_info_keyboard(site_id, callback.from_user.id)
     )
     await callback.answer()
 
@@ -737,7 +1018,6 @@ async def process_edit_value(message: Message, state: FSMContext) -> None:
         success = update_site(_config, add_keyword_site_id, _config_path, keywords=all_keywords)
 
         if success:
-            # Удаляем сообщение пользователя для чистоты
             try:
                 await message.delete()
             except Exception:
@@ -771,14 +1051,13 @@ async def process_edit_value(message: Message, state: FSMContext) -> None:
     success = update_site(_config, site_id, _config_path, **{field: value})
 
     if success:
-        # Удаляем сообщение пользователя для чистоты
         try:
             await message.delete()
         except Exception:
             pass
         await message.answer(
             f"✅ Поле успешно обновлено!",
-            reply_markup=_site_info_keyboard(site_id)
+            reply_markup=_site_info_keyboard(site_id, message.from_user.id)
         )
     else:
         await message.answer("❌ Не удалось обновить поле")
@@ -801,10 +1080,9 @@ async def callback_set_support(callback: CallbackQuery) -> None:
 
     if success:
         await callback.answer(f"✅ Уровень поддержки: {level}")
-        site = get_site_by_id(_config, site_id)
         await callback.message.edit_text(
             f"✅ Уровень поддержки обновлён: {level}",
-            reply_markup=_site_info_keyboard(site_id)
+            reply_markup=_site_info_keyboard(site_id, callback.from_user.id)
         )
     else:
         await callback.answer("❌ Ошибка обновления", show_alert=True)
@@ -1116,6 +1394,8 @@ async def callback_remove_user(callback: CallbackQuery) -> None:
         await callback.answer("❌ Ошибка удаления", show_alert=True)
 
 
+# ==================== Добавление сайта ====================
+
 @router.callback_query(F.data == "add_site")
 @router.message(Command("add_site"))
 async def cmd_add_site(event, state: FSMContext) -> None:
@@ -1339,7 +1619,7 @@ async def process_notify_users(message: Message, state: FSMContext) -> None:
             f"🔗 URL: {site.url}\n"
             f"⭐ Поддержка: {site.support_level}",
             parse_mode="HTML",
-            reply_markup=_site_info_keyboard(site.id)
+            reply_markup=_site_info_keyboard(site.id, message.from_user.id)
         )
     else:
         await message.answer("❌ Не удалось добавить сайт")
@@ -1353,11 +1633,13 @@ async def callback_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# ==================== Setup ====================
+
 def setup_bot(
     config: Config,
-    state_manager: StateManager,
+    database: Database,
     notifier: TelegramNotifier,
-    users_file: str = "users.json",
+    scheduler: MonitorScheduler = None,
     config_path: str = "config.yaml"
 ) -> tuple[Bot, Dispatcher]:
     """
@@ -1365,20 +1647,20 @@ def setup_bot(
 
     Args:
         config: Конфигурация приложения
-        state_manager: Менеджер состояния
+        database: База данных
         notifier: Telegram-нотификатор
-        users_file: Путь к файлу пользователей
+        scheduler: Планировщик (опционально)
         config_path: Путь к файлу конфигурации
 
     Returns:
         Кортеж (Bot, Dispatcher)
     """
-    global _config, _state_manager, _notifier, _users_file, _config_path
+    global _config, _database, _notifier, _scheduler, _config_path
 
     _config = config
-    _state_manager = state_manager
+    _database = database
     _notifier = notifier
-    _users_file = users_file
+    _scheduler = scheduler
     _config_path = config_path
 
     bot = Bot(token=config.telegram.bot_token)
@@ -1394,8 +1676,10 @@ async def _setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="myid", description="Показать мой Telegram ID"),
         BotCommand(command="my_sites", description="Мои сайты"),
+        BotCommand(command="muted", description="Заглушенные сайты"),
         BotCommand(command="status_all", description="Статус всех сайтов (админ)"),
         BotCommand(command="check_now", description="Проверить все сейчас (админ)"),
+        BotCommand(command="stats", description="Статистика сайтов (админ)"),
         BotCommand(command="sites", description="Управление сайтами (админ)"),
         BotCommand(command="add_site", description="Добавить сайт (админ)"),
     ]
@@ -1440,22 +1724,18 @@ async def start_bot_webhook(
     """
     await _setup_bot_commands(bot)
 
-    # Удаляем старый webhook и устанавливаем новый
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook установлен: {webhook_url}")
 
-    # Создаём aiohttp приложение
     app = web.Application()
 
-    # Настраиваем webhook handler
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot
     )
     webhook_requests_handler.register(app, path=webhook_path)
 
-    # Настраиваем startup/shutdown
     setup_application(app, dp, bot=bot)
 
     logger.info(f"Telegram-бот запущен (webhook) на {host}:{port}")
@@ -1477,10 +1757,5 @@ async def run_webhook_server(app: web.Application, host: str, port: int) -> None
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    # Держим сервер запущенным
     while True:
         await asyncio.sleep(3600)
-
-
-# Нужен импорт asyncio для run_webhook_server
-import asyncio
