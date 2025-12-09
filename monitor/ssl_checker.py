@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtensionOID
+from cryptography.x509 import DNSName
 
 
 def _to_punycode(hostname: str) -> str:
@@ -90,7 +91,7 @@ def _parse_certificate(cert_der: bytes) -> dict:
     san_list = []
     try:
         san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-        san_list = [name.value for name in san_ext.value if isinstance(name, x509.DNSName)]
+        san_list = san_ext.value.get_values_for_type(DNSName)
     except x509.ExtensionNotFound:
         pass
 
