@@ -185,9 +185,8 @@ def _support_level_keyboard(site_id: str = "") -> InlineKeyboardMarkup:
     prefix = f"set_support:{site_id}:" if site_id else "new_support:"
     buttons = [
         [
-            InlineKeyboardButton(text="⚪ None", callback_data=f"{prefix}none"),
-            InlineKeyboardButton(text="🟡 Standard", callback_data=f"{prefix}standard"),
-            InlineKeyboardButton(text="🟢 Premium", callback_data=f"{prefix}premium")
+            InlineKeyboardButton(text="🟡 Стандарт", callback_data=f"{prefix}standard"),
+            InlineKeyboardButton(text="🟢 Премиум", callback_data=f"{prefix}premium")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1751,9 +1750,8 @@ async def process_site_url(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="⚪ None", callback_data="new_support:none"),
-                InlineKeyboardButton(text="🟡 Standard", callback_data="new_support:standard"),
-                InlineKeyboardButton(text="🟢 Premium", callback_data="new_support:premium")
+                InlineKeyboardButton(text="🟡 Стандарт", callback_data="new_support:standard"),
+                InlineKeyboardButton(text="🟢 Премиум", callback_data="new_support:premium")
             ]
         ])
     )
