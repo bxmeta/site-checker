@@ -68,7 +68,7 @@ class TelegramNotifier:
         }
 
         if reply_markup:
-            payload["reply_markup"] = reply_markup.model_dump()
+            payload["reply_markup"] = reply_markup.model_dump(exclude_none=True)
 
         try:
             async with aiohttp.ClientSession() as session:

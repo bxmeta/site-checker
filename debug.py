@@ -13,8 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from monitor.config_loader import load_config, SiteConfig
 from monitor.database import Database
 from monitor.notifier import TelegramNotifier
-from monitor.retry_logic import check_with_retry
-from monitor.checker import CheckResult
+from monitor.checker import CheckResult, check_site
 
 
 async def main():
@@ -81,13 +80,13 @@ async def main():
     await notifier.notify_site_down(test_site, fake_result)
     print(f"   ✅ notify_site_down вызван")
 
-    # Проверка сайтов
-    print(f"\n🔍 ПРОВЕРКА САЙТОВ:")
+    # Проверка сайтов (без retry, быстро)
+    print(f"\n🔍 ПРОВЕРКА САЙТОВ (таймаут {config.default.timeout_seconds}с):")
     print("-" * 50)
     for site in config.sites:
-        print(f"   Проверяю: {site.name}...", end=" ", flush=True)
+        print(f"   {site.name}...", end=" ", flush=True)
         try:
-            result = await check_with_retry(site, config.default)
+            result = await check_site(site, config.default)
             if result.success:
                 print(f"✅ {result.status_code}")
             else:
