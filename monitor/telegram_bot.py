@@ -20,7 +20,8 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 from .config_loader import (
     Config, SiteConfig, get_sites_for_user, get_site_by_id,
-    add_site, remove_site, update_site, add_notify_user, remove_notify_user
+    add_site, remove_site, update_site, add_notify_user, remove_notify_user,
+    add_admin, remove_admin
 )
 from .database import Database
 from .notifier import TelegramNotifier, format_duration
@@ -322,16 +323,23 @@ async def cmd_my_sites(message: Message) -> None:
         return
 
     user_id = message.from_user.id
-    sites = get_sites_for_user(_config, user_id)
+
+    # Админы видят все сайты, остальные — только свои
+    if _is_admin(user_id):
+        sites = _config.sites
+        title = "📋 <b>Все сайты:</b>\n"
+    else:
+        sites = get_sites_for_user(_config, user_id)
+        title = "📋 <b>Ваши сайты:</b>\n"
 
     if not sites:
         await message.answer(
             "📋 Вы не подписаны на уведомления ни одного сайта.\n\n"
-            "Попросите администратора добавить ваш ID в notify_users для нужных сайтов."
+            "Попросите администратора добавить ваш ID в подписчики."
         )
         return
 
-    lines = ["📋 <b>Ваши сайты:</b>\n"]
+    lines = [title]
     for site in sites:
         state = _database.get_state(site.id) if _database else None
         status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
@@ -492,6 +500,129 @@ async def cmd_muted(message: Message) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: Message) -> None:
+    """Показывает список администраторов."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None:
+        await message.answer("❌ Конфигурация не загружена")
+        return
+
+    lines = ["👑 <b>Администраторы:</b>\n"]
+    for admin_id in _config.telegram.admin_ids:
+        # Попробуем получить информацию из базы
+        user_info = _database.get_user(admin_id) if _database else None
+        if user_info:
+            name = user_info.full_name or user_info.username or str(admin_id)
+            lines.append(f"• {name} (<code>{admin_id}</code>)")
+        else:
+            lines.append(f"• <code>{admin_id}</code>")
+
+    lines.append(f"\nВсего: {len(_config.telegram.admin_ids)}")
+    lines.append("\n<i>Добавить: /add_admin ID\nУдалить: /remove_admin ID</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("add_admin"))
+async def cmd_add_admin(message: Message) -> None:
+    """Добавляет нового администратора."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None:
+        await message.answer("❌ Конфигурация не загружена")
+        return
+
+    # Парсим аргументы
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "❌ Укажите Telegram ID пользователя\n\n"
+            "Пример: <code>/add_admin 123456789</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        new_admin_id = int(args[1].strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом")
+        return
+
+    if new_admin_id in _config.telegram.admin_ids:
+        await message.answer("ℹ️ Этот пользователь уже администратор")
+        return
+
+    if add_admin(_config, new_admin_id, _config_path):
+        # Получаем имя если есть в базе
+        user_info = _database.get_user(new_admin_id) if _database else None
+        name = ""
+        if user_info:
+            name = f" ({user_info.full_name or user_info.username})"
+
+        await message.answer(
+            f"✅ Администратор добавлен: <code>{new_admin_id}</code>{name}",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Не удалось добавить администратора")
+
+
+@router.message(Command("remove_admin"))
+async def cmd_remove_admin(message: Message) -> None:
+    """Удаляет администратора."""
+    user_id = message.from_user.id
+
+    if not _is_admin(user_id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    if _config is None:
+        await message.answer("❌ Конфигурация не загружена")
+        return
+
+    # Парсим аргументы
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "❌ Укажите Telegram ID администратора\n\n"
+            "Пример: <code>/remove_admin 123456789</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        admin_to_remove = int(args[1].strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом")
+        return
+
+    if admin_to_remove not in _config.telegram.admin_ids:
+        await message.answer("ℹ️ Этот пользователь не является администратором")
+        return
+
+    if len(_config.telegram.admin_ids) <= 1:
+        await message.answer("❌ Нельзя удалить последнего администратора")
+        return
+
+    if remove_admin(_config, admin_to_remove, _config_path):
+        await message.answer(
+            f"✅ Администратор удалён: <code>{admin_to_remove}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Не удалось удалить администратора")
 
 
 # ==================== Callback handlers для меню ====================

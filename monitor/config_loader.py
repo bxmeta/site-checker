@@ -335,3 +335,55 @@ def remove_notify_user(
         site.notify_users.remove(user_id)
         save_config(config, config_path)
     return True
+
+
+def add_admin(
+    config: Config,
+    user_id: int,
+    config_path: str = "config.yaml"
+) -> bool:
+    """
+    Добавляет администратора.
+
+    Args:
+        config: Объект конфигурации
+        user_id: Telegram ID пользователя
+        config_path: Путь к файлу конфигурации
+
+    Returns:
+        True, если администратор добавлен
+    """
+    if user_id in config.telegram.admin_ids:
+        return False
+
+    config.telegram.admin_ids.append(user_id)
+    save_config(config, config_path)
+    return True
+
+
+def remove_admin(
+    config: Config,
+    user_id: int,
+    config_path: str = "config.yaml"
+) -> bool:
+    """
+    Удаляет администратора.
+
+    Args:
+        config: Объект конфигурации
+        user_id: Telegram ID пользователя
+        config_path: Путь к файлу конфигурации
+
+    Returns:
+        True, если администратор удалён
+    """
+    if user_id not in config.telegram.admin_ids:
+        return False
+
+    # Не даём удалить последнего админа
+    if len(config.telegram.admin_ids) <= 1:
+        return False
+
+    config.telegram.admin_ids.remove(user_id)
+    save_config(config, config_path)
+    return True
