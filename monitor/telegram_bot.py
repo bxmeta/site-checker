@@ -40,8 +40,6 @@ _config_path: str = "config.yaml"
 
 class AddSiteStates(StatesGroup):
     """Состояния для добавления сайта."""
-    waiting_for_id = State()
-    waiting_for_name = State()
     waiting_for_url = State()
     waiting_for_support_level = State()
     waiting_for_expected_code = State()
@@ -58,6 +56,27 @@ class EditSiteStates(StatesGroup):
 def _is_admin(user_id: int) -> bool:
     """Проверяет, является ли пользователь администратором."""
     return _config is not None and user_id in _config.telegram.admin_ids
+
+
+def _extract_domain(url: str) -> str:
+    """Извлекает домен из URL."""
+    # Убираем протокол
+    domain = url.replace("https://", "").replace("http://", "")
+    # Убираем путь и параметры
+    domain = domain.split("/")[0].split("?")[0].split("#")[0]
+    # Убираем www.
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _generate_site_id(domain: str) -> str:
+    """Генерирует ID сайта из домена."""
+    # Заменяем точки и дефисы на подчёркивания
+    site_id = domain.replace(".", "_").replace("-", "_")
+    # Убираем лишние символы
+    site_id = re.sub(r"[^a-zA-Z0-9_]", "", site_id)
+    return site_id
 
 
 def _sites_list_keyboard(page: int = 0, items_per_page: int = 5) -> InlineKeyboardMarkup:
@@ -1412,14 +1431,13 @@ async def cmd_add_site(event, state: FSMContext) -> None:
         await message.answer("❌ Эта команда доступна только администраторам")
         return
 
-    await state.set_state(AddSiteStates.waiting_for_id)
+    await state.set_state(AddSiteStates.waiting_for_url)
     await state.update_data(new_site={})
 
     text = (
         "➕ <b>Добавление нового сайта</b>\n\n"
-        "Шаг 1/7: Введите уникальный ID сайта\n"
-        "(латинские буквы, цифры, подчёркивание)\n\n"
-        "Пример: <code>my_site_1</code>"
+        "Шаг 1/5: Введите URL сайта\n\n"
+        "Пример: <code>https://example.com</code>"
     )
 
     if isinstance(event, CallbackQuery):
@@ -1428,74 +1446,38 @@ async def cmd_add_site(event, state: FSMContext) -> None:
         await message.answer(text, parse_mode="HTML")
 
 
-@router.message(StateFilter(AddSiteStates.waiting_for_id))
-async def process_site_id(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода ID сайта."""
-    site_id = message.text.strip()
-
-    if not re.match(r"^[a-zA-Z0-9_]+$", site_id):
-        await message.answer("❌ ID может содержать только латинские буквы, цифры и подчёркивание")
-        return
-
-    if get_site_by_id(_config, site_id):
-        await message.answer("❌ Сайт с таким ID уже существует")
-        return
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["id"] = site_id
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_name)
-
-    await message.answer(
-        "✅ ID принят!\n\n"
-        "Шаг 2/7: Введите название сайта\n\n"
-        "Пример: <code>Мой сайт</code>",
-        parse_mode="HTML"
-    )
-
-
-@router.message(StateFilter(AddSiteStates.waiting_for_name))
-async def process_site_name(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода названия сайта."""
-    name = message.text.strip()
-
-    if len(name) < 1 or len(name) > 100:
-        await message.answer("❌ Название должно быть от 1 до 100 символов")
-        return
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["name"] = name
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_url)
-
-    await message.answer(
-        "✅ Название принято!\n\n"
-        "Шаг 3/7: Введите URL сайта\n\n"
-        "Пример: <code>https://example.com</code>",
-        parse_mode="HTML"
-    )
-
-
 @router.message(StateFilter(AddSiteStates.waiting_for_url))
 async def process_site_url(message: Message, state: FSMContext) -> None:
     """Обработчик ввода URL сайта."""
     url = message.text.strip()
 
+    # Добавляем https:// если не указан протокол
     if not url.startswith(("http://", "https://")):
-        await message.answer("❌ URL должен начинаться с http:// или https://")
+        url = "https://" + url
+
+    # Извлекаем домен и генерируем ID
+    domain = _extract_domain(url)
+    site_id = _generate_site_id(domain)
+
+    # Проверяем, не существует ли уже такой сайт
+    if get_site_by_id(_config, site_id):
+        await message.answer(
+            f"❌ Сайт с доменом {domain} уже существует",
+            parse_mode="HTML"
+        )
         return
 
     data = await state.get_data()
     new_site = data.get("new_site", {})
+    new_site["id"] = site_id
+    new_site["name"] = domain
     new_site["url"] = url
     await state.update_data(new_site=new_site)
     await state.set_state(AddSiteStates.waiting_for_support_level)
 
     await message.answer(
-        "✅ URL принят!\n\n"
-        "Шаг 4/7: Выберите уровень поддержки",
+        f"✅ Сайт: <b>{domain}</b>\n\n"
+        "Шаг 2/5: Выберите уровень поддержки",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -1520,7 +1502,7 @@ async def process_new_support(callback: CallbackQuery, state: FSMContext) -> Non
 
     await callback.message.edit_text(
         f"✅ Уровень поддержки: {level}\n\n"
-        "Шаг 5/7: Введите ожидаемый HTTP код\n\n"
+        "Шаг 3/5: Введите ожидаемый HTTP код\n\n"
         "Пример: <code>200</code>",
         parse_mode="HTML"
     )
@@ -1546,7 +1528,7 @@ async def process_expected_code(message: Message, state: FSMContext) -> None:
 
     await message.answer(
         f"✅ Ожидаемый код: {code}\n\n"
-        "Шаг 6/7: Введите ключевые слова через запятую\n"
+        "Шаг 4/5: Введите ключевые слова через запятую\n"
         "(или отправьте <code>-</code> чтобы пропустить)\n\n"
         "Пример: <code>Welcome, Home, Login</code>",
         parse_mode="HTML"
@@ -1572,7 +1554,7 @@ async def process_keywords(message: Message, state: FSMContext) -> None:
     keywords_str = ", ".join(keywords) if keywords else "—"
     await message.answer(
         f"✅ Ключевые слова: {keywords_str}\n\n"
-        "Шаг 7/7: Введите Telegram ID пользователей для уведомлений\n"
+        "Шаг 5/5: Введите Telegram ID пользователей для уведомлений\n"
         "(через запятую или <code>-</code> чтобы пропустить)\n\n"
         "Пример: <code>123456789, 987654321</code>",
         parse_mode="HTML"
