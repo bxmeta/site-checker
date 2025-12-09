@@ -1,6 +1,7 @@
 """
 Модуль HTTP-проверок сайтов.
 """
+import asyncio
 import ssl
 import time
 from dataclasses import dataclass
@@ -109,12 +110,12 @@ async def check_site(
             error_type="no_response"
         )
 
-    except aiohttp.ServerTimeoutError:
+    except (aiohttp.ServerTimeoutError, asyncio.TimeoutError):
         response_time_ms = int((time.time() - start_time) * 1000)
         return CheckResult(
             success=False,
             response_time_ms=response_time_ms,
-            error="Timeout",
+            error="Превышено время ожидания",
             error_type="timeout"
         )
 
