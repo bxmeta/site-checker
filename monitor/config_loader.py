@@ -40,6 +40,7 @@ class Bitrix24Config:
     admin_users: List[int] = field(default_factory=list)
     application_token: str = ""           # auth[application_token] из событий портала; пусто - запомнить из первого события
     allowed_ips: List[str] = field(default_factory=list)  # откуда принимать события (IP портала); пусто - отовсюду
+    trusted_proxies: List[str] = field(default_factory=list)  # прокси, чьему X-Real-IP верим (loopback всегда)
 
 
 @dataclass
@@ -161,6 +162,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
         admin_users=_int_list(b24_data.get("admin_users", [])),
         application_token=str(b24_data.get("application_token", "") or "").strip(),
         allowed_ips=[str(x).strip() for x in (b24_data.get("allowed_ips", []) or []) if str(x).strip()],
+        trusted_proxies=[str(x).strip() for x in (b24_data.get("trusted_proxies", []) or []) if str(x).strip()],
     )
 
     ssl_data = data.get("ssl", {}) or {}
@@ -258,6 +260,7 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
             "admin_users": config.bitrix24.admin_users,
             "application_token": config.bitrix24.application_token,
             "allowed_ips": config.bitrix24.allowed_ips,
+            "trusted_proxies": config.bitrix24.trusted_proxies,
         },
         "ssl": {
             "expiry_warn_days": config.ssl.expiry_warn_days,

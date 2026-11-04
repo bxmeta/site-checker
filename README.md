@@ -329,6 +329,7 @@ bitrix24:
   admin_users: [42]         # ID пользователей портала, которым доступны /add и /del
   application_token: ""     # auth[application_token] из событий; пусто - запомнить из первого события
   allowed_ips: [1.2.3.4]    # IP портала: события бота принимаются только с них
+  trusted_proxies: []       # прокси, чьему X-Real-IP верим (loopback, то есть локальный nginx, всегда)
 ```
 
 - Состояние бота в `b24_auth.json` (каталог данных): `bot_id`, `chat_dialog_id`, `application_token`, id команд.

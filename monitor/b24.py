@@ -486,7 +486,7 @@ class B24BotApp:
         auth = payload.get("auth") or {}
         token = str(auth.get("application_token") or "") if isinstance(auth, dict) else ""
 
-        client_ip = request.headers.get("X-Real-IP") or (request.remote or "")
+        client_ip = self._client_ip(request)
         if self.b24.allowed_ips and client_ip not in self.b24.allowed_ips:
             logger.warning(f"B24: событие {event} с адреса {client_ip} отклонено (не в allowed_ips)")
             return web.Response(status=403, text="forbidden")
@@ -502,6 +502,18 @@ class B24BotApp:
         # Отвечаем сразу, обработку делаем в фоне: /check может идти десятки секунд
         asyncio.create_task(self._dispatch(event, data))
         return web.Response(text="ok")
+
+    _LOOPBACK = ("127.0.0.1", "::1")
+
+    def _client_ip(self, request: web.Request) -> str:
+        """
+        IP отправителя события. Заголовку X-Real-IP верим только если TCP-пир - локальный nginx
+        (loopback) или адрес из bitrix24.trusted_proxies; иначе заголовок подделываем снаружи.
+        """
+        peer = request.remote or ""
+        if peer in self._LOOPBACK or peer in self.b24.trusted_proxies:
+            return request.headers.get("X-Real-IP") or peer
+        return peer
 
     def _check_token(self, token: str) -> bool:
         """
