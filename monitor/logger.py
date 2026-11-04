@@ -3,6 +3,7 @@
 """
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Optional
 
@@ -33,7 +34,10 @@ def setup_logger(log_file: str = "monitor.log") -> logging.Logger:
     if logger.handlers:
         return logger
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    # Ротация: 20 МБ x 5 файлов, иначе лог растёт бесконечно
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
     file_handler.setLevel(logging.INFO)
 
     console_handler = logging.StreamHandler()

@@ -147,6 +147,14 @@ class Database:
                     error_message TEXT
                 );
 
+                -- Отправленные предупреждения об истечении SSL
+                CREATE TABLE IF NOT EXISTS ssl_warnings (
+                    site_id TEXT PRIMARY KEY,
+                    expiry_date TEXT NOT NULL,
+                    last_warned_at TEXT NOT NULL,
+                    warn_count INTEGER DEFAULT 0
+                );
+
                 -- Индексы
                 CREATE INDEX IF NOT EXISTS idx_incidents_site ON incidents(site_id);
                 CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at);
@@ -312,6 +320,43 @@ class Database:
                 """, (new_fail_streak, now, site_id))
 
                 return False
+
+    # ==================== Предупреждения SSL ====================
+
+    def should_warn_ssl_expiry(self, site_id: str, expiry_date: str, remind_every_hours: int) -> bool:
+        """
+        Нужно ли отправлять предупреждение об истечении сертификата.
+
+        True, если для этого сертификата (site_id + дата истечения) ещё не предупреждали
+        или прошло больше remind_every_hours с прошлого предупреждения.
+        Смена даты истечения (сертификат перевыпустили) сбрасывает историю.
+        """
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT expiry_date, last_warned_at FROM ssl_warnings WHERE site_id = ?",
+                (site_id,)
+            ).fetchone()
+        if not row or row["expiry_date"] != expiry_date:
+            return True
+        last = parse_datetime(row["last_warned_at"])
+        return now_izhevsk() - last >= timedelta(hours=remind_every_hours)
+
+    def mark_ssl_warned(self, site_id: str, expiry_date: str) -> None:
+        """Фиксирует отправленное предупреждение об истечении сертификата."""
+        now = format_datetime()
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO ssl_warnings (site_id, expiry_date, last_warned_at, warn_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(site_id) DO UPDATE SET
+                    warn_count = CASE WHEN expiry_date = excluded.expiry_date THEN warn_count + 1 ELSE 1 END,
+                    expiry_date = excluded.expiry_date,
+                    last_warned_at = excluded.last_warned_at
+            """, (site_id, expiry_date, now))
+
+    def clear_ssl_warning(self, site_id: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM ssl_warnings WHERE site_id = ?", (site_id,))
 
     # ==================== Напоминания ====================
 

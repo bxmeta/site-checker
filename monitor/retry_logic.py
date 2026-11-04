@@ -3,17 +3,18 @@
 """
 import asyncio
 import logging
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional
 
 from .checker import CheckResult, check_site
-from .config_loader import SiteConfig, DefaultConfig
+from .config_loader import SiteConfig, DefaultConfig, SslConfig
 
 logger = logging.getLogger("site_monitor")
 
 
 async def check_with_retry(
     site: SiteConfig,
-    defaults: DefaultConfig
+    defaults: DefaultConfig,
+    ssl_config: Optional[SslConfig] = None
 ) -> CheckResult:
     """
     Выполняет проверку сайта с повторными попытками при неудаче.
@@ -33,7 +34,7 @@ async def check_with_retry(
     last_result = None
 
     for attempt in range(retry_count):
-        result = await check_site(site, defaults)
+        result = await check_site(site, defaults, ssl_config)
 
         if result.success:
             if attempt > 0:
@@ -58,7 +59,8 @@ async def check_with_retry(
 
 async def check_site_single(
     site: SiteConfig,
-    defaults: DefaultConfig
+    defaults: DefaultConfig,
+    ssl_config: Optional[SslConfig] = None
 ) -> CheckResult:
     """
     Выполняет одну проверку сайта без повторных попыток.
@@ -70,4 +72,4 @@ async def check_site_single(
     Returns:
         CheckResult - результат проверки
     """
-    return await check_site(site, defaults)
+    return await check_site(site, defaults, ssl_config)
