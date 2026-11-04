@@ -2081,6 +2081,8 @@ async def start_bot(bot: Bot, dp: Dispatcher) -> None:
         dp: Диспетчер
     """
     await _setup_bot_commands(bot)
+    # Если раньше бот работал через webhook (другой сервер), polling конфликтует с ним
+    await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Telegram-бот запущен (polling)")
     await dp.start_polling(bot)
 
