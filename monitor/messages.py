@@ -8,6 +8,7 @@ from typing import Callable, List, Optional
 
 from .checker import CheckResult
 from .config_loader import SiteConfig
+from .groups import groups_label
 from .ssl_checker import SSLCheckResult
 from .time_utils import format_for_message
 
@@ -81,9 +82,11 @@ def format_down_message(site: SiteConfig, result: CheckResult, bold: Bold) -> st
         "",
         f"Название: {site.name}",
         f"URL: {site.url}",
-        f"Поддержка: {site.support_level}",
+        f"Группы: {groups_label(site.groups)}",
         f"Проблема: {failure_description(site, result)}",
     ]
+    if result.verdict:
+        lines.append(f"{bold('Где сломалось:')} {result.verdict}")
     hint = _FAILURE_HINTS.get(result.error_type or "")
     if hint:
         lines.append(f"Что это значит: {hint}")
@@ -114,7 +117,7 @@ def format_ssl_expiring_message(site: SiteConfig, ssl_result: SSLCheckResult, bo
         "",
         f"Название: {site.name}",
         f"URL: {site.url}",
-        f"Поддержка: {site.support_level}",
+        f"Группы: {groups_label(site.groups)}",
         f"Истекает: {ssl_result.expiry_str}",
         f"Издатель: {ssl_result.issuer_str}",
         f"Выдан на: {ssl_result.subject_cn or '-'}",
@@ -124,6 +127,46 @@ def format_ssl_expiring_message(site: SiteConfig, ssl_result: SSLCheckResult, bo
         "",
         f"Время: {format_for_message()}",
     ])
+
+
+def format_ssl_auto_renew_failed_message(site: SiteConfig, ssl_result: SSLCheckResult, bold: Bold) -> str:
+    """Автопродляемый сертификат (Let's Encrypt и т.п.) не перевыпустился вовремя."""
+    days = ssl_result.days_until_expiry if ssl_result.days_until_expiry is not None else 0
+    when = "сегодня" if days <= 0 else ("завтра" if days == 1 else f"через {days} дн.")
+    return "\n".join([
+        bold(f"🔐 Автопродление сертификата не сработало, истекает {when}"),
+        "",
+        f"Название: {site.name}",
+        f"URL: {site.url}",
+        f"Группы: {groups_label(site.groups)}",
+        f"Истекает: {ssl_result.expiry_str}",
+        f"Издатель: {ssl_result.issuer_str}",
+        "",
+        "Такие сертификаты обычно перевыпускаются автоматически за 30 дней до конца срока. "
+        "Раз этого не случилось, проверьте на сервере certbot/acme.sh, права на webroot и DNS домена, "
+        "иначе сайт уйдёт в DOWN с ошибкой ssl_expired.",
+        "",
+        f"Время: {format_for_message()}",
+    ])
+
+
+def format_up_message(site: SiteConfig, result: CheckResult, bold: Bold,
+                      downtime_seconds: Optional[int] = None) -> str:
+    """Уведомление о восстановлении сайта (общее для каналов)."""
+    from .notifier import format_duration
+    code = str(result.status_code) if result.status_code is not None else "нет"
+    lines = [
+        bold("✅ Сайт восстановлен"),
+        "",
+        f"Название: {site.name}",
+        f"URL: {site.url}",
+        f"Группы: {groups_label(site.groups)}",
+        f"Код: {code}" + (f", ответ {result.response_time_ms} мс" if result.response_time_ms is not None else ""),
+    ]
+    if downtime_seconds:
+        lines.append(f"Простой: {format_duration(downtime_seconds)}")
+    lines.append(f"Время: {format_for_message()}")
+    return "\n".join(lines)
 
 
 def format_check_line(site: SiteConfig, result: CheckResult) -> str:

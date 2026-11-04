@@ -10,7 +10,9 @@ from .config_loader import SiteConfig, TelegramConfig
 from .checker import CheckResult
 from .ssl_checker import SSLCheckResult
 from .time_utils import format_for_message
-from .messages import format_down_message, format_ssl_expiring_message
+from .messages import (
+    format_down_message, format_ssl_expiring_message, format_ssl_auto_renew_failed_message, format_up_message,
+)
 
 
 def _html_bold(text: str) -> str:
@@ -99,6 +101,7 @@ class TelegramNotifier:
         return {"inline_keyboard": [[
             {"text": "🔇 Заглушить", "callback_data": f"mute_site:{site_id}"},
             {"text": "🔄 Проверить", "callback_data": f"check_now:{site_id}"},
+            {"text": "📄 Карточка", "callback_data": f"site:{site_id}"},
         ]]}
 
     def _create_unmute_keyboard(self, site_id: str) -> dict:
@@ -173,7 +176,10 @@ class TelegramNotifier:
     ) -> None:
         """Предупреждает об истечении платного SSL-сертификата."""
         recipients = self._get_all_recipients(site, user_ids)
-        message = format_ssl_expiring_message(site, ssl_result, _html_bold)
+        if ssl_result.auto_renew:
+            message = format_ssl_auto_renew_failed_message(site, ssl_result, _html_bold)
+        else:
+            message = format_ssl_expiring_message(site, ssl_result, _html_bold)
         for user_id in recipients:
             success = await self.send_message(user_id, message)
             if success:
@@ -231,23 +237,8 @@ class TelegramNotifier:
         check_result: CheckResult,
         downtime_seconds: Optional[int] = None
     ) -> str:
-        """Форматирует сообщение о восстановлении сайта."""
-        status_code_str = str(check_result.status_code) if check_result.status_code else "N/A"
-
-        lines = [
-            "✅ <b>Сайт восстановлен</b>\n",
-            f"Название: {site.name}",
-            f"URL: {site.url}",
-            f"Статус поддержки: {site.support_level}",
-            f"Код: {status_code_str}",
-        ]
-
-        if downtime_seconds is not None and downtime_seconds > 0:
-            lines.append(f"Простой: {format_duration(downtime_seconds)}")
-
-        lines.append(f"Время: {format_for_message()}")
-
-        return "\n".join(lines)
+        """Форматирует сообщение о восстановлении сайта (общий текст)."""
+        return format_up_message(site, check_result, _html_bold, downtime_seconds)
 
     def _format_reminder_message(
         self,

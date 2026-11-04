@@ -9,6 +9,7 @@ from typing import List, Optional
 import yaml
 
 from .changelog import log_change
+from .groups import normalize_groups, DEFAULT_GROUP
 
 
 @dataclass
@@ -62,6 +63,7 @@ class DefaultConfig:
 class SslConfig:
     """Настройки SSL-проверок."""
     expiry_warn_days: int = 3            # предупреждать об истечении платного сертификата за N дней
+    auto_renew_warn_days: int = 7        # для автопродляемых (Let's Encrypt): если осталось меньше, продление сломано
     remind_every_hours: int = 24         # повторять предупреждение не чаще, чем раз в N часов
     # Издатели с автопродлением (ACME): про срок действия не предупреждаем
     auto_renew_issuers: List[str] = field(default_factory=lambda: ["Let's Encrypt", "ZeroSSL"])
@@ -73,7 +75,8 @@ class SiteConfig:
     id: str
     name: str
     url: str
-    support_level: str = "none"
+    support_level: str = "none"                              # устарело: первая группа из groups
+    groups: List[str] = field(default_factory=list)          # hosting / vip / premium / standard, можно несколько
     check_ssl: bool = True
     check_http_code: bool = True
     expected_code: int = 200
@@ -169,6 +172,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
     ssl_defaults = SslConfig()
     ssl_cfg = SslConfig(
         expiry_warn_days=int(ssl_data.get("expiry_warn_days", ssl_defaults.expiry_warn_days)),
+        auto_renew_warn_days=int(ssl_data.get("auto_renew_warn_days", ssl_defaults.auto_renew_warn_days)),
         remind_every_hours=int(ssl_data.get("remind_every_hours", ssl_defaults.remind_every_hours)),
         auto_renew_issuers=list(ssl_data.get("auto_renew_issuers", ssl_defaults.auto_renew_issuers) or []),
     )
@@ -176,11 +180,17 @@ def load_config(config_path: str = "config.yaml") -> Config:
     sites: List[SiteConfig] = []
     seen = set()
     for site_data in data.get("sites", []) or []:
+        raw_groups = site_data.get("groups")
+        if raw_groups is None:
+            # Старый формат: одно поле support_level
+            raw_groups = [site_data.get("support_level", "none") or "none"]
+        groups = normalize_groups(raw_groups if isinstance(raw_groups, list) else [raw_groups])
         site = SiteConfig(
             id=str(site_data.get("id", "") or ""),
             name=str(site_data.get("name", "") or ""),
             url=str(site_data.get("url", "") or ""),
-            support_level=str(site_data.get("support_level", "none") or "none"),
+            support_level=groups[0] if groups else "none",
+            groups=groups,
             check_ssl=bool(site_data.get("check_ssl", True)),
             check_http_code=bool(site_data.get("check_http_code", True)),
             expected_code=int(site_data.get("expected_code", 200)),
@@ -264,6 +274,7 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
         },
         "ssl": {
             "expiry_warn_days": config.ssl.expiry_warn_days,
+            "auto_renew_warn_days": config.ssl.auto_renew_warn_days,
             "remind_every_hours": config.ssl.remind_every_hours,
             "auto_renew_issuers": config.ssl.auto_renew_issuers,
         },
@@ -276,7 +287,8 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
             "id": site.id,
             "name": site.name,
             "url": site.url,
-            "support_level": site.support_level,
+            "support_level": site.groups[0] if site.groups else "none",
+            "groups": list(site.groups),
             "check_ssl": site.check_ssl,
             "check_http_code": site.check_http_code,
             "expected_code": site.expected_code,
@@ -302,11 +314,13 @@ def add_site(config: Config, site: SiteConfig, config_path: str = "config.yaml")
     if get_site_by_id(config, site.id):
         return False
 
+    site.groups = normalize_groups(site.groups or [site.support_level])
+    site.support_level = site.groups[0] if site.groups else "none"
     config.sites.append(site)
     save_config(config, config_path)
     log_change(
         "добавлен сайт", f"{site.id} ({site.url})",
-        f"название: {site.name}; уровень: {site.support_level}; ssl: {'да' if site.check_ssl else 'нет'}; "
+        f"название: {site.name}; группы: {', '.join(site.groups) or 'нет'}; ssl: {'да' if site.check_ssl else 'нет'}; "
         f"код: {site.expected_code if site.check_http_code else 'не проверяется'}; ключевые слова: {site.keywords or 'нет'}",
         config_path
     )
@@ -332,9 +346,15 @@ def update_site(config: Config, site_id: str, config_path: str = "config.yaml", 
         return False
 
     allowed_fields = {
-        "name", "url", "support_level", "check_ssl", "check_http_code",
+        "name", "url", "support_level", "groups", "check_ssl", "check_http_code",
         "expected_code", "keywords", "notify_users", "notify_b24_users"
     }
+
+    if "support_level" in kwargs and "groups" not in kwargs:
+        kwargs["groups"] = [kwargs.pop("support_level")]
+    if "groups" in kwargs:
+        kwargs["groups"] = normalize_groups(kwargs["groups"])
+        kwargs["support_level"] = kwargs["groups"][0] if kwargs["groups"] else "none"
 
     changes = []
     for key, value in kwargs.items():

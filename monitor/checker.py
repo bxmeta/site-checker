@@ -48,6 +48,8 @@ class CheckResult:
     html_content: Optional[str] = None
     ssl: Optional[SSLCheckResult] = None       # результат SSL-проверки, если выполнялась
     diagnostics: List[str] = field(default_factory=list)  # пошаговая диагностика при падении
+    verdict: Optional[str] = None              # итог диагностики: где сломалось
+    ip: Optional[str] = None                   # IP сервера, с которым соединились
 
 
 def _elapsed_ms(start_time: float) -> int:
@@ -77,6 +79,18 @@ def _classify_connector_error(e: aiohttp.ClientConnectorError, hostname: str, po
 
     detail = os_err.strerror if os_err is not None and getattr(os_err, "strerror", None) else str(os_err or e)
     return "no_response", f"Не удалось подключиться к {hostname}:{port} ({detail})"
+
+
+async def _resolve_ip(hostname: str) -> Optional[str]:
+    """Первый IP домена (для карточки сайта и диагностики смены IP)."""
+    try:
+        loop = asyncio.get_event_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(hostname.encode("idna").decode("ascii"), None, proto=6), timeout=5
+        )
+        return infos[0][4][0] if infos else None
+    except Exception:
+        return None
 
 
 async def check_site(
@@ -109,6 +123,17 @@ async def check_site(
             async with session.get(site.url, ssl=ssl_context) as response:
                 response_time_ms = _elapsed_ms(start_time)
                 status_code = response.status
+                peer_ip = None
+                try:
+                    conn = getattr(response, "connection", None) or getattr(response, "_connection", None)
+                    transport = getattr(conn, "transport", None) if conn else None
+                    peer = transport.get_extra_info("peername") if transport else None
+                    if peer:
+                        peer_ip = peer[0]
+                except Exception:
+                    peer_ip = None
+                if not peer_ip:
+                    peer_ip = await _resolve_ip(hostname)
                 html_content = await response.text(errors="replace")
 
                 if site.check_http_code and status_code != site.expected_code:
@@ -120,6 +145,7 @@ async def check_site(
                               + f", ожидался {site.expected_code}",
                         error_type="wrong_code",
                         html_content=html_content,
+                        ip=peer_ip,
                     )
 
                 ssl_result: Optional[SSLCheckResult] = None
@@ -138,6 +164,7 @@ async def check_site(
                             error_type=ssl_result.error_type,
                             html_content=html_content,
                             ssl=ssl_result,
+                            ip=peer_ip,
                         )
 
                 if site.keywords:
@@ -151,6 +178,7 @@ async def check_site(
                             error_type="keyword_missing",
                             html_content=html_content,
                             ssl=ssl_result,
+                            ip=peer_ip,
                         )
 
                 return CheckResult(
@@ -159,6 +187,7 @@ async def check_site(
                     response_time_ms=response_time_ms,
                     html_content=html_content,
                     ssl=ssl_result,
+                    ip=peer_ip,
                 )
 
     except aiohttp.ClientConnectorError as e:

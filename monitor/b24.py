@@ -25,9 +25,12 @@ from aiohttp import web
 
 from .changelog import set_actor, reset_actor, b24_actor
 from .checker import CheckResult
-from .config_loader import Config, SiteConfig, get_site_by_id, add_site, remove_site
+from .config_loader import Config, SiteConfig, get_site_by_id, add_site, remove_site, update_site
 from .database import Database
-from .messages import format_down_message, format_ssl_expiring_message
+from .groups import normalize_groups, groups_label, KNOWN_GROUPS, group_label
+from .messages import (
+    format_down_message, format_ssl_expiring_message, format_ssl_auto_renew_failed_message, format_up_message,
+)
 from .notifier import format_duration
 from .ssl_checker import SSLCheckResult
 from .time_utils import format_for_message
@@ -36,12 +39,13 @@ logger = logging.getLogger("site_monitor")
 
 # Команды бота: имя -> (описание, подсказка параметров)
 COMMANDS = {
-    "status": ("Статус всех сайтов", ""),
+    "status": ("Статус сайтов: сводка, или список группы (/status hosting), или всё (/status all)", "[группа|all]"),
     "check": ("Проверить все сайты сейчас (или один: /check id)", "[id сайта]"),
     "mute": ("Не напоминать о падении сайта до восстановления", "id сайта"),
     "unmute": ("Снова напоминать о падении сайта", "id сайта"),
-    "add": ("Добавить сайт в мониторинг (админ)", "https://site.ru"),
+    "add": ("Добавить сайт в мониторинг (админ): /add site.ru hosting vip", "ссылка [группы]"),
     "del": ("Удалить сайт из мониторинга (админ)", "id сайта"),
+    "groups": ("Группы сайта (админ): /groups id +vip -standard", "id [+группа] [-группа]"),
     "help": ("Справка по командам", ""),
 }
 
@@ -263,7 +267,10 @@ class Bitrix24Notifier:
 
     async def notify_ssl_expiring(self, site: SiteConfig, ssl_result: SSLCheckResult,
                                   user_ids: Optional[List[int]] = None) -> None:
-        text = format_ssl_expiring_message(site, ssl_result, _bb_bold)
+        if ssl_result.auto_renew:
+            text = format_ssl_auto_renew_failed_message(site, ssl_result, _bb_bold)
+        else:
+            text = format_ssl_expiring_message(site, ssl_result, _bb_bold)
         await self._broadcast(site, text)
 
     async def send_reminder(self, site: SiteConfig, reminder_number: int, downtime_seconds: int,
@@ -286,18 +293,7 @@ class Bitrix24Notifier:
 
     def _format_up_message(self, site: SiteConfig, check_result: CheckResult,
                            downtime_seconds: Optional[int] = None) -> str:
-        status_code_str = str(check_result.status_code) if check_result.status_code else "нет"
-        lines = [
-            "✅ [B]Сайт восстановлен[/B]\n",
-            f"Название: {site.name}",
-            f"URL: {site.url}",
-            f"Поддержка: {site.support_level}",
-            f"Код: {status_code_str}",
-        ]
-        if downtime_seconds is not None and downtime_seconds > 0:
-            lines.append(f"Простой: {format_duration(downtime_seconds)}")
-        lines.append(f"Время: {format_for_message()}")
-        return "\n".join(lines)
+        return format_up_message(site, check_result, _bb_bold, downtime_seconds)
 
 
 # ==================== Разбор событий ====================
@@ -577,7 +573,7 @@ class B24BotApp:
             return
         logger.info(f"B24: команда /{name} {args} от {from_user} в {dialog_id}")
         if name == "status":
-            await self._cmd_status(dialog_id)
+            await self._cmd_status(dialog_id, args)
         elif name == "check":
             await self._cmd_check(dialog_id, args)
         elif name == "mute":
@@ -594,6 +590,12 @@ class B24BotApp:
             token = set_actor(b24_actor(from_user))
             try:
                 await self._cmd_del(dialog_id, args, from_user)
+            finally:
+                reset_actor(token)
+        elif name == "groups":
+            token = set_actor(b24_actor(from_user))
+            try:
+                await self._cmd_groups(dialog_id, args, from_user)
             finally:
                 reset_actor(token)
         elif name in ("help", "start"):
@@ -620,26 +622,51 @@ class B24BotApp:
 
     # --- Команды ---
 
-    async def _cmd_status(self, dialog_id: str) -> None:
+    async def _cmd_status(self, dialog_id: str, args: str = "") -> None:
+        """Сводка по всем сайтам; с аргументом - список группы или всех сайтов."""
         if not self.config.sites:
             await self.notifier.send_message(dialog_id, "Список сайтов пуст")
             return
         states = self.database.get_all_states()
-        up: List[str] = []
-        down: List[str] = []
-        for site in self.config.sites:
-            state = states.get(site.id)
-            if state and state.status == "DOWN":
-                downtime = format_duration(self.database.get_downtime_seconds(site.id))
-                down.append(f"🔴 {site.name} ({site.id}) - недоступен {downtime}")
-            else:
-                up.append(f"🟢 {site.name}")
-        lines = [f"[B]Статус сайтов[/B] ({len(self.config.sites)}): 🟢 {len(up)}, 🔴 {len(down)}", ""]
-        lines.extend(down)
-        if down and up:
+        arg = args.strip().lower()
+        sites = list(self.config.sites)
+        title = "Статус сайтов"
+        if arg and arg != "all":
+            sites = [s for s in sites if arg in s.groups]
+            title = f"{group_label(arg)}"
+            if not sites:
+                known = ", ".join(KNOWN_GROUPS)
+                await self.notifier.send_message(dialog_id, f"Группа \"{arg}\" пуста или не существует. Группы: {known}")
+                return
+
+        def is_down(s):
+            st = states.get(s.id)
+            return st is not None and st.status == "DOWN"
+
+        down = sorted((s for s in sites if is_down(s)), key=lambda s: states[s.id].last_status_change or "")
+        up = sorted((s for s in sites if not is_down(s)), key=lambda s: s.name.lower())
+        lines = [f"[B]{title}[/B]: {len(sites)} · 🟢 {len(up)} · 🔴 {len(down)}"]
+        for s in down:
+            st = states[s.id]
+            reason = st.last_error or ""
+            lines.append(f"🔴 {s.name} - {format_duration(self.database.get_downtime_seconds(s.id))}"
+                         + (f": {reason}" if reason else ""))
+        if arg:
+            if down and up:
+                lines.append("")
+            lines.extend(f"🟢 {s.name}" for s in up)
+        else:
+            counts = []
+            for g in KNOWN_GROUPS:
+                n = sum(1 for s in sites if g in s.groups)
+                if n:
+                    nd = sum(1 for s in sites if g in s.groups and is_down(s))
+                    counts.append(f"{group_label(g)}: {n}" + (f" (🔴 {nd})" if nd else ""))
+            if counts:
+                lines.append("")
+                lines.extend(counts)
             lines.append("")
-        lines.extend(up)
-        lines.append("")
+            lines.append("Список группы: /status hosting, все сайты: /status all")
         lines.append(f"Время: {format_for_message()}")
         await self.notifier.send_message(dialog_id, "\n".join(lines))
 
@@ -687,29 +714,50 @@ class B24BotApp:
         if not self._is_admin(from_user):
             await self.notifier.send_message(dialog_id, "❌ Команда доступна только администраторам мониторинга")
             return
-        url = args.split()[0] if args else ""
-        if not url:
-            await self.notifier.send_message(dialog_id, "Укажите адрес: /add https://site.ru")
+        tokens = [t for t in re.split(r"[\s,;]+", args.strip()) if t]
+        groups = normalize_groups([t for t in tokens if t.lower() in KNOWN_GROUPS]) or ["standard"]
+        urls = [t for t in tokens if t.lower() not in KNOWN_GROUPS]
+        if not urls:
+            await self.notifier.send_message(dialog_id, "Укажите адрес: /add https://site.ru [hosting vip]")
             return
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        parsed = urlparse(url)
-        if not parsed.hostname:
-            await self.notifier.send_message(dialog_id, f"Не похоже на адрес сайта: {args}")
+        lines = []
+        for raw in urls:
+            url = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+            domain = urlparse(url).hostname
+            if not domain:
+                lines.append(f"⚠️ {raw}: не похоже на адрес сайта")
+                continue
+            site_id = _domain_to_site_id(domain)
+            if get_site_by_id(self.config, site_id):
+                lines.append(f"⚠️ {domain}: уже в мониторинге ({site_id})")
+                continue
+            site = SiteConfig(id=site_id, name=domain, url=url, support_level=groups[0], groups=list(groups))
+            add_site(self.config, site, self.config_path)
+            line = ""
+            if self.scheduler is not None:
+                line = await self.scheduler.check_single_site(site.id) or ""
+            lines.append(f"➕ {site.name} ({site.id}), группы: {groups_label(groups)}\n{line}".rstrip())
+        await self.notifier.send_message(dialog_id, "\n".join(lines))
+
+    async def _cmd_groups(self, dialog_id: str, args: str, from_user: int) -> None:
+        if not self._is_admin(from_user):
+            await self.notifier.send_message(dialog_id, "❌ Команда доступна только администраторам мониторинга")
             return
-        domain = parsed.hostname
-        site_id = _domain_to_site_id(domain)
-        if get_site_by_id(self.config, site_id):
-            await self.notifier.send_message(dialog_id, f"Сайт {domain} уже в мониторинге ({site_id})")
+        tokens = args.split()
+        site = self._find_site(tokens[0]) if tokens else None
+        if not site:
+            await self.notifier.send_message(dialog_id, "Укажите сайт: /groups id +vip -standard. Группы: " + ", ".join(KNOWN_GROUPS))
             return
-        site = SiteConfig(id=site_id, name=domain, url=url, support_level="standard")
-        add_site(self.config, site, self.config_path)
-        line = ""
-        if self.scheduler is not None:
-            line = await self.scheduler.check_single_site(site.id) or ""
-        await self.notifier.send_message(
-            dialog_id, f"➕ Сайт добавлен: {site.name} ({site.id})\n{line}".rstrip()
-        )
+        groups = list(site.groups)
+        for t in tokens[1:]:
+            g = t.lstrip("+-").lower()
+            if t.startswith("-"):
+                groups = [x for x in groups if x != g]
+            elif g and g not in groups:
+                groups.append(g)
+        if len(tokens) > 1:
+            update_site(self.config, site.id, self.config_path, groups=groups)
+        await self.notifier.send_message(dialog_id, f"🏷 {site.name}: {groups_label(site.groups)}")
 
     async def _cmd_del(self, dialog_id: str, args: str, from_user: int) -> None:
         if not self._is_admin(from_user):

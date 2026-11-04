@@ -33,6 +33,7 @@ bitrix24:
 
 ssl:
   expiry_warn_days: 3
+  auto_renew_warn_days: 7
   remind_every_hours: 24
   auto_renew_issuers:
   - Let's Encrypt
@@ -44,7 +45,7 @@ sites:
   - id: example_com
     name: example.com
     url: https://example.com
-    support_level: premium      # none / standard / premium / vip / hosting
+    groups: [premium]           # hosting / vip / premium / standard, можно несколько
     check_ssl: true
     check_http_code: true
     expected_code: 200

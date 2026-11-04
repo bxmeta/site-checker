@@ -26,6 +26,16 @@ class SiteState:
     reminder_count: int = 0
     next_reminder_at: Optional[str] = None
     current_incident_id: Optional[int] = None
+    # Сведения о последней проверке (для карточки сайта и диагностики)
+    last_check_at: Optional[str] = None
+    last_status_code: Optional[int] = None
+    last_response_ms: Optional[int] = None
+    last_error: Optional[str] = None
+    last_error_type: Optional[str] = None
+    last_ip: Optional[str] = None          # IP, на который резолвился домен при последней удачной проверке
+    ssl_expiry: Optional[str] = None       # ISO, дата истечения сертификата
+    ssl_issuer: Optional[str] = None
+    ssl_auto_renew: Optional[bool] = None
 
 
 @dataclass
@@ -162,6 +172,15 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_sites_status ON sites_state(status);
                 CREATE INDEX IF NOT EXISTS idx_sites_next_reminder ON sites_state(next_reminder_at);
             """)
+            # Миграция: столбцы последней проверки (ALTER TABLE в SQLite только по одному)
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(sites_state)")}
+            for column, ddl in (
+                ("last_check_at", "TEXT"), ("last_status_code", "INTEGER"), ("last_response_ms", "INTEGER"),
+                ("last_error", "TEXT"), ("last_error_type", "TEXT"), ("last_ip", "TEXT"),
+                ("ssl_expiry", "TEXT"), ("ssl_issuer", "TEXT"), ("ssl_auto_renew", "INTEGER"),
+            ):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE sites_state ADD COLUMN {column} {ddl}")
 
     # ==================== Состояние сайтов ====================
 
@@ -174,15 +193,7 @@ class Database:
             ).fetchone()
 
             if row:
-                return SiteState(
-                    status=row["status"],
-                    fail_streak=row["fail_streak"],
-                    last_status_change=row["last_status_change"],
-                    last_notify_at=row["last_notify_at"],
-                    reminder_count=row["reminder_count"],
-                    next_reminder_at=row["next_reminder_at"],
-                    current_incident_id=row["current_incident_id"]
-                )
+                return self._row_to_state(row)
 
             # Создаём новую запись
             now = format_datetime()
@@ -198,23 +209,62 @@ class Database:
                 last_status_change=now
             )
 
+    @staticmethod
+    def _row_to_state(row: sqlite3.Row) -> SiteState:
+        keys = row.keys()
+        get = lambda k: row[k] if k in keys else None
+        return SiteState(
+            status=row["status"],
+            fail_streak=row["fail_streak"],
+            last_status_change=row["last_status_change"],
+            last_notify_at=row["last_notify_at"],
+            reminder_count=row["reminder_count"],
+            next_reminder_at=row["next_reminder_at"],
+            current_incident_id=row["current_incident_id"],
+            last_check_at=get("last_check_at"),
+            last_status_code=get("last_status_code"),
+            last_response_ms=get("last_response_ms"),
+            last_error=get("last_error"),
+            last_error_type=get("last_error_type"),
+            last_ip=get("last_ip"),
+            ssl_expiry=get("ssl_expiry"),
+            ssl_issuer=get("ssl_issuer"),
+            ssl_auto_renew=(None if get("ssl_auto_renew") is None else bool(get("ssl_auto_renew"))),
+        )
+
     def get_all_states(self) -> Dict[str, SiteState]:
         """Возвращает состояние всех сайтов."""
         with self._get_connection() as conn:
             rows = conn.execute("SELECT * FROM sites_state").fetchall()
+            return {row["site_id"]: self._row_to_state(row) for row in rows}
 
-            return {
-                row["site_id"]: SiteState(
-                    status=row["status"],
-                    fail_streak=row["fail_streak"],
-                    last_status_change=row["last_status_change"],
-                    last_notify_at=row["last_notify_at"],
-                    reminder_count=row["reminder_count"],
-                    next_reminder_at=row["next_reminder_at"],
-                    current_incident_id=row["current_incident_id"]
-                )
-                for row in rows
-            }
+    def record_check(self, site_id: str, success: bool, status_code: Optional[int], response_ms: Optional[int],
+                     error: Optional[str], error_type: Optional[str], ip: Optional[str],
+                     ssl_expiry: Optional[str] = None, ssl_issuer: Optional[str] = None,
+                     ssl_auto_renew: Optional[bool] = None) -> None:
+        """Сохраняет сведения о последней проверке. last_ip обновляется только при удачной проверке."""
+        self.get_state(site_id)  # гарантирует строку
+        now = format_datetime()
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE sites_state SET
+                    last_check_at = ?, last_status_code = ?, last_response_ms = ?,
+                    last_error = ?, last_error_type = ?,
+                    last_ip = COALESCE(?, last_ip),
+                    ssl_expiry = COALESCE(?, ssl_expiry),
+                    ssl_issuer = COALESCE(?, ssl_issuer),
+                    ssl_auto_renew = COALESCE(?, ssl_auto_renew)
+                WHERE site_id = ?
+            """, (now, status_code, response_ms, error, error_type,
+                  ip if (success and ip) else None,
+                  ssl_expiry, ssl_issuer, None if ssl_auto_renew is None else int(ssl_auto_renew), site_id))
+
+    def delete_site_state(self, site_id: str) -> None:
+        """Удаляет состояние и заглушки сайта (при удалении сайта из конфига)."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM sites_state WHERE site_id = ?", (site_id,))
+            conn.execute("DELETE FROM user_mutes WHERE site_id = ?", (site_id,))
+            conn.execute("DELETE FROM ssl_warnings WHERE site_id = ?", (site_id,))
 
     def update_on_success(self, site_id: str) -> Tuple[bool, Optional[int]]:
         """

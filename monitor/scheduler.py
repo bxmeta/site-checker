@@ -15,6 +15,7 @@ from .diagnostics import diagnose
 from .logger import log_check_result
 from .messages import format_check_line
 from .retry_logic import check_with_retry
+from .time_utils import format_datetime
 
 logger = logging.getLogger("site_monitor")
 
@@ -39,12 +40,33 @@ class MonitorScheduler:
     # ==================== Обработка результата ====================
 
     async def attach_diagnostics(self, site: SiteConfig, result: CheckResult) -> None:
-        """Дополняет результат пошаговой диагностикой (DNS, ping, TCP, TLS, HTTP)."""
+        """Дополняет результат пошаговой диагностикой (DNS, ping, TCP, TLS, HTTP) и вердиктом."""
         try:
-            result.diagnostics = await diagnose(site.url, self.config.default.timeout_seconds)
-            logger.info(f"[{site.id}] Диагностика: " + " | ".join(result.diagnostics))
+            state = self.database.get_state(site.id)
+            diagnosis = await diagnose(
+                site.url, self.config.default.timeout_seconds,
+                last_ip=state.last_ip, error_type=result.error_type,
+            )
+            result.diagnostics = diagnosis.lines
+            result.verdict = diagnosis.verdict
+            logger.info(f"[{site.id}] Диагностика: " + " | ".join(result.diagnostics)
+                        + (f" => {diagnosis.verdict}" if diagnosis.verdict else ""))
         except Exception as e:
             logger.error(f"[{site.id}] Ошибка диагностики: {e}")
+
+    def _record(self, site: SiteConfig, result: CheckResult) -> None:
+        """Сохраняет сведения о последней проверке (для карточки сайта и диагностики)."""
+        ssl_res = result.ssl
+        try:
+            self.database.record_check(
+                site.id, result.success, result.status_code, result.response_time_ms,
+                result.error, result.error_type, result.ip,
+                ssl_expiry=format_datetime(ssl_res.expiry_date) if ssl_res and ssl_res.expiry_date else None,
+                ssl_issuer=ssl_res.issuer_str if ssl_res and ssl_res.expiry_date else None,
+                ssl_auto_renew=ssl_res.auto_renew if ssl_res and ssl_res.expiry_date else None,
+            )
+        except Exception as e:
+            logger.error(f"[{site.id}] Не удалось записать результат проверки: {e}")
 
     async def _handle_result(self, site: SiteConfig, result: CheckResult) -> None:
         """Записывает результат в БД, шлёт уведомления о смене статуса и SSL."""
@@ -52,6 +74,7 @@ class MonitorScheduler:
             logger, site.id, result.success,
             result.status_code, result.response_time_ms, result.error
         )
+        self._record(site, result)
 
         if result.success:
             status_changed, downtime_seconds = self.database.update_on_success(site.id)
@@ -71,17 +94,18 @@ class MonitorScheduler:
 
     async def _check_ssl_expiry(self, site: SiteConfig, result: CheckResult) -> None:
         """
-        Предупреждает об истечении платного сертификата за ssl.expiry_warn_days.
-        Для издателей с автопродлением (Let's Encrypt и т.п.) не предупреждает.
+        Платный сертификат: предупреждение за ssl.expiry_warn_days до истечения.
+        Автопродляемый (Let's Encrypt, ZeroSSL): предупреждение, если до истечения осталось
+        меньше ssl.auto_renew_warn_days, то есть автопродление не сработало.
+        Повтор не чаще ssl.remind_every_hours; перевыпуск сертификата сбрасывает историю.
         """
         ssl_result = result.ssl
         if not ssl_result or not ssl_result.valid or ssl_result.days_until_expiry is None:
             return
-        if ssl_result.auto_renew:
-            return
 
         ssl_cfg = self.config.ssl
-        if ssl_result.days_until_expiry > ssl_cfg.expiry_warn_days:
+        threshold = ssl_cfg.auto_renew_warn_days if ssl_result.auto_renew else ssl_cfg.expiry_warn_days
+        if ssl_result.days_until_expiry > threshold:
             return
 
         expiry_key = ssl_result.expiry_date.isoformat()
@@ -92,7 +116,8 @@ class MonitorScheduler:
             await self.notifier.notify_ssl_expiring(site, ssl_result)
             self.database.mark_ssl_warned(site.id, expiry_key)
             logger.info(
-                f"[{site.id}] Предупреждение: SSL ({ssl_result.issuer_str}) истекает "
+                f"[{site.id}] Предупреждение: SSL ({ssl_result.issuer_str}, "
+                f"{'автопродление' if ssl_result.auto_renew else 'платный'}) истекает "
                 f"{ssl_result.expiry_str}, осталось {ssl_result.days_until_expiry} дн."
             )
         except Exception as e:

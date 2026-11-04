@@ -1,15 +1,26 @@
 """
-Telegram-бот для управления мониторингом.
+Telegram-бот управления мониторингом.
+
+Принципы интерфейса:
+- один экран = одно сообщение, переходы редактируют его (без простыней из сообщений);
+- главный экран - сводка: сколько в порядке, что лежит и почему, кнопки по группам;
+- списки короткие и постраничные, карточка сайта - вся суть в 6-8 строках;
+- добавление сайта одним сообщением: ссылка (или несколько) и, по желанию, группы;
+- группы переключаются кнопками, подписаться на сайт может сам пользователь.
+
+Навигация кодируется в callback_data: "site:<id>:<kind>:<page>", где kind - вид списка,
+из которого открыли карточку (all, down, my, muted, g_<группа>, q_<запрос>).
 """
 import asyncio
 import logging
 import re
-from typing import Optional
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.filters import Command, StateFilter
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -18,23 +29,36 @@ from aiogram.types import (
     BotCommand
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
+from .changelog import set_actor, reset_actor, tg_actor, read_changes
 from .config_loader import (
-    Config, SiteConfig, get_sites_for_user, get_site_by_id,
+    Config, SiteConfig, get_site_by_id,
     add_site, remove_site, update_site, add_notify_user, remove_notify_user,
     add_admin, remove_admin
 )
-from .changelog import set_actor, reset_actor, tg_actor, read_changes
-from .database import Database
+from .database import Database, SiteState
+from .groups import KNOWN_GROUPS, group_label, group_emoji, group_title, groups_label, normalize_groups, DEFAULT_GROUP
 from .notifier import TelegramNotifier, format_duration
-from .scheduler import run_immediate_check, MonitorScheduler
+from .scheduler import MonitorScheduler
 from .time_utils import parse_datetime, now_izhevsk
-from .retry_logic import check_with_retry
 
 logger = logging.getLogger("site_monitor")
 
 router = Router()
 
+_config: Optional[Config] = None
+_database: Optional[Database] = None
+_notifier: Optional[TelegramNotifier] = None
+_scheduler: Optional[MonitorScheduler] = None
+_config_path: str = "config.yaml"
+_check_all_lock = asyncio.Lock()
+
+PAGE_SIZE = 10
+MAX_DOWN_ON_DASHBOARD = 8
+
+
+# ==================== Служебное ====================
 
 async def _actor_middleware(handler, event, data):
     """Запоминает автора действия для журнала изменений (changes.log)."""
@@ -50,1977 +74,1125 @@ async def _actor_middleware(handler, event, data):
 router.message.outer_middleware(_actor_middleware)
 router.callback_query.outer_middleware(_actor_middleware)
 
-_config: Optional[Config] = None
-_database: Optional[Database] = None
-_notifier: Optional[TelegramNotifier] = None
-_scheduler: Optional[MonitorScheduler] = None
-_config_path: str = "config.yaml"
+
+class AddStates(StatesGroup):
+    waiting_urls = State()
 
 
-class AddSiteStates(StatesGroup):
-    """Состояния для добавления сайта."""
-    waiting_for_url = State()
-    waiting_for_support_level = State()
-    waiting_for_keywords = State()
-    waiting_for_notify_users = State()
+class EditStates(StatesGroup):
+    waiting_value = State()
 
 
-class EditSiteStates(StatesGroup):
-    """Состояния для редактирования сайта."""
-    waiting_for_field = State()
-    waiting_for_value = State()
+class SearchStates(StatesGroup):
+    waiting_query = State()
+
+
+class SubStates(StatesGroup):
+    waiting_user_id = State()
+
+
+class AdminStates(StatesGroup):
+    waiting_user_id = State()
 
 
 def _is_admin(user_id: int) -> bool:
-    """Проверяет, является ли пользователь администратором."""
     return _config is not None and user_id in _config.telegram.admin_ids
 
 
-async def _check_new_site(site: SiteConfig) -> str:
-    """
-    Немедленно проверяет новый сайт и возвращает результат.
-    Если сайт недоступен — сразу уведомляет всех получателей.
-    """
-    result = await check_with_retry(site, _config.default, _config.ssl)
+def _esc(text) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    if result.success:
-        # Всё ок - записываем успешное состояние
-        _database.update_on_success(site.id)
-        return f"✅ Проверка пройдена (код {result.status_code})"
+
+def _kb(rows: List[List[Tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """Строит клавиатуру из списка строк [(текст, callback_data), ...]."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t[:60], callback_data=c) for t, c in row] for row in rows if row
+    ])
+
+
+async def _show(event, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    """Показывает экран: для callback редактирует сообщение, для команды отвечает новым."""
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                await event.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        try:
+            await event.answer()
+        except Exception:
+            pass
     else:
-        # Сайт недоступен - сразу помечаем DOWN и уведомляем
-        # Используем retry_count=1 чтобы сразу перейти в DOWN
-        status_changed = _database.update_on_failure(
-            site.id,
-            retry_count=1,  # Сразу DOWN без ожидания retry
-            error_type=result.error_type,
-            error_message=result.error
-        )
-        if status_changed:
-            if _scheduler is not None:
-                await _scheduler.attach_diagnostics(site, result)
-            await _notifier.notify_site_down(site, result)
-        return f"❌ Проблема: {result.error}"
+        await event.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
-def _extract_domain(url: str) -> str:
-    """Извлекает домен из URL."""
-    # Убираем протокол
-    domain = url.replace("https://", "").replace("http://", "")
-    # Убираем путь и параметры
-    domain = domain.split("/")[0].split("?")[0].split("#")[0]
-    # Убираем www.
-    if domain.startswith("www."):
-        domain = domain[4:]
-    return domain
-
-
-def _generate_site_id(domain: str) -> str:
-    """Генерирует ID сайта из домена (кириллические домены через Punycode)."""
+def _ago(iso: Optional[str]) -> str:
+    """"5 мин", "2 ч 10 мин", "3 дн" с момента iso до сейчас."""
+    if not iso:
+        return "-"
     try:
-        domain = domain.encode("idna").decode("ascii")
-    except UnicodeError:
-        pass
-    # Заменяем точки и дефисы на подчёркивания
-    site_id = domain.replace(".", "_").replace("-", "_")
-    # Убираем лишние символы
-    site_id = re.sub(r"[^a-zA-Z0-9_]", "", site_id)
-    return site_id
+        seconds = int((now_izhevsk() - parse_datetime(iso)).total_seconds())
+    except Exception:
+        return "-"
+    return format_duration(max(0, seconds))
 
 
-def _sites_list_keyboard(page: int = 0, items_per_page: int = 5) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру со списком сайтов."""
-    if not _config:
-        return InlineKeyboardMarkup(inline_keyboard=[])
-
-    sites = _config.sites
-    total_pages = max(1, (len(sites) + items_per_page - 1) // items_per_page)
-    page = max(0, min(page, total_pages - 1))
-
-    start_idx = page * items_per_page
-    end_idx = min(start_idx + items_per_page, len(sites))
-
-    buttons = []
-    for site in sites[start_idx:end_idx]:
-        state = _database.get_state(site.id) if _database else None
-        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{status_emoji} {site.name}",
-                callback_data=f"site_info:{site.id}"
-            )
-        ])
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"sites_page:{page - 1}"))
-    nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"sites_page:{page + 1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    buttons.append([InlineKeyboardButton(text="➕ Добавить сайт", callback_data="add_site")])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def _hhmm(iso: Optional[str]) -> str:
+    if not iso:
+        return "-"
+    try:
+        dt = parse_datetime(iso)
+        today = now_izhevsk().date()
+        return dt.strftime("%H:%M") if dt.date() == today else dt.strftime("%d.%m %H:%M")
+    except Exception:
+        return "-"
 
 
-def _site_info_keyboard(site_id: str, user_id: int = 0) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру для управления сайтом."""
-    buttons = [
-        [
-            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_site:{site_id}"),
-            InlineKeyboardButton(text="🔍 Проверить", callback_data=f"check_site:{site_id}")
-        ],
-        [
-            InlineKeyboardButton(text="👥 Подписчики", callback_data=f"site_users:{site_id}"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data=f"site_stats:{site_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_site:{site_id}")
-        ],
-    ]
-
-    # Добавляем кнопку mute/unmute если сайт DOWN
-    if _database:
-        state = _database.get_state(site_id)
-        if state.status == "DOWN" and user_id:
-            is_muted = _database.is_muted(user_id, site_id)
-            if is_muted:
-                buttons.append([
-                    InlineKeyboardButton(
-                        text="🔔 Включить напоминания",
-                        callback_data=f"unmute_site:{site_id}"
-                    )
-                ])
-            else:
-                buttons.append([
-                    InlineKeyboardButton(
-                        text="🔇 Заглушить напоминания",
-                        callback_data=f"mute_site:{site_id}"
-                    )
-                ])
-
-    buttons.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="sites_list")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def _state(site_id: str) -> Optional[SiteState]:
+    return _database.get_state(site_id) if _database else None
 
 
-def _edit_site_keyboard(site_id: str) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру для редактирования полей сайта."""
-    buttons = [
-        [
-            InlineKeyboardButton(text="📝 Имя", callback_data=f"edit_field:{site_id}:name"),
-            InlineKeyboardButton(text="🔗 URL", callback_data=f"edit_field:{site_id}:url")
-        ],
-        [
-            InlineKeyboardButton(text="⭐ Уровень", callback_data=f"edit_field:{site_id}:support_level"),
-            InlineKeyboardButton(text="📊 HTTP код", callback_data=f"edit_field:{site_id}:expected_code")
-        ],
-        [
-            InlineKeyboardButton(text="🔐 SSL", callback_data=f"toggle_ssl:{site_id}"),
-            InlineKeyboardButton(text="📡 HTTP", callback_data=f"toggle_http:{site_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🔑 Ключевые слова", callback_data=f"edit_keywords:{site_id}")
-        ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"site_info:{site_id}")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def _is_down(state: Optional[SiteState]) -> bool:
+    return bool(state and state.status == "DOWN")
 
 
-def _support_level_keyboard(site_id: str = "") -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру выбора уровня поддержки."""
-    prefix = f"set_support:{site_id}:" if site_id else "new_support:"
-    buttons = [
-        [
-            InlineKeyboardButton(text="🟡 Стандарт", callback_data=f"{prefix}standard"),
-            InlineKeyboardButton(text="🟢 Премиум", callback_data=f"{prefix}premium")
-        ],
-        [
-            InlineKeyboardButton(text="⭐ VIP", callback_data=f"{prefix}vip"),
-            InlineKeyboardButton(text="🏠 Хостинг", callback_data=f"{prefix}hosting")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+_SHORT_ERRORS = {
+    "timeout": "не отвечает", "dns": "DNS", "conn_refused": "порт закрыт", "conn_reset": "сброс соединения",
+    "no_response": "недоступен", "wrong_code": "неверный код", "redirect_loop": "цикл редиректов",
+    "bad_response": "битый ответ", "keyword_missing": "контент", "ssl_expired": "SSL истёк",
+    "ssl_not_yet_valid": "SSL не действует", "ssl_mismatch": "чужой SSL", "ssl_untrusted": "SSL не доверенный",
+    "ssl_handshake": "TLS",
+}
 
 
-def _confirm_delete_keyboard(site_id: str) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру подтверждения удаления."""
-    buttons = [
-        [
-            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{site_id}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"site_info:{site_id}")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def _short_error(state: Optional[SiteState]) -> str:
+    if not state:
+        return ""
+    short = _SHORT_ERRORS.get(state.last_error_type or "", "")
+    if state.last_error_type == "wrong_code" and state.last_status_code:
+        short = f"код {state.last_status_code}"
+    return short or (state.last_error_type or "ошибка")
 
 
-def _site_users_keyboard(site_id: str) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру управления подписчиками сайта."""
-    site = get_site_by_id(_config, site_id) if _config else None
-    buttons = []
-
-    if site and site.notify_users:
-        for user_id in site.notify_users:
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"👤 {user_id}",
-                    callback_data="noop"
-                ),
-                InlineKeyboardButton(
-                    text="❌",
-                    callback_data=f"remove_user:{site_id}:{user_id}"
-                )
-            ])
-
-    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_user:{site_id}")])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"site_info:{site_id}")])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def _keywords_keyboard(site_id: str) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру управления ключевыми словами."""
-    site = get_site_by_id(_config, site_id) if _config else None
-    buttons = []
-
-    if site and site.keywords:
-        for kw in site.keywords:
-            buttons.append([
-                InlineKeyboardButton(text=f"🔑 {kw}", callback_data="noop"),
-                InlineKeyboardButton(text="❌", callback_data=f"remove_kw:{site_id}:{kw}")
-            ])
-
-    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_keyword:{site_id}")])
-    if site and site.keywords:
-        buttons.append([InlineKeyboardButton(text="🗑 Очистить все", callback_data=f"clear_keywords:{site_id}")])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"edit_site:{site_id}")])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Создаёт главное меню с кнопками."""
-    buttons = [
-        [InlineKeyboardButton(text="🆔 Мой ID", callback_data="menu_myid")],
-        [InlineKeyboardButton(text="📋 Мои сайты", callback_data="menu_my_sites")],
-    ]
-
-    # Добавляем кнопку "Мои заглушки" если есть
-    if _database:
-        muted = _database.get_user_mutes(user_id)
-        if muted:
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"🔇 Заглушенные ({len(muted)})",
-                    callback_data="menu_muted"
-                )
-            ])
-
+def _visible_sites(user_id: int) -> List[SiteConfig]:
+    if _config is None:
+        return []
     if _is_admin(user_id):
-        buttons.extend([
-            [InlineKeyboardButton(text="📊 Статус всех сайтов", callback_data="menu_status_all")],
-            [InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="menu_check_now")],
-            [InlineKeyboardButton(text="⚙️ Управление сайтами", callback_data="sites_list")],
-            [InlineKeyboardButton(text="➕ Добавить сайт", callback_data="add_site")],
-            [InlineKeyboardButton(text="👑 Администраторы", callback_data="menu_admins")],
-        ])
+        return list(_config.sites)
+    return [s for s in _config.sites if user_id in s.notify_users]
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def _resolve_list(kind: str, user_id: int) -> Tuple[str, List[SiteConfig]]:
+    """Возвращает (заголовок, сайты) для вида списка."""
+    sites = _visible_sites(user_id)
+    states = _database.get_all_states() if _database else {}
+    if kind == "all":
+        return ("📋 Все сайты" if _is_admin(user_id) else "📋 Мои сайты"), sites
+    if kind == "my":
+        return "📋 Мои сайты", [s for s in (_config.sites if _config else []) if user_id in s.notify_users]
+    if kind == "down":
+        return "🔴 Проблемы", [s for s in sites if _is_down(states.get(s.id))]
+    if kind == "muted":
+        muted = set(_database.get_user_mutes(user_id)) if _database else set()
+        return "🔇 Заглушенные", [s for s in sites if s.id in muted]
+    if kind.startswith("g_"):
+        g = kind[2:]
+        return group_label(g), [s for s in sites if g in s.groups]
+    if kind.startswith("q_"):
+        q = kind[2:].lower()
+        return f"🔎 Поиск: {q}", [s for s in sites if q in s.name.lower() or q in s.url.lower() or q in s.id.lower()]
+    return "📋 Сайты", sites
+
+
+def _site_button_text(site: SiteConfig, state: Optional[SiteState]) -> str:
+    if _is_down(state):
+        return f"🔴 {site.name} · {_ago(state.last_status_change)} · {_short_error(state)}"
+    return f"🟢 {site.name}"
+
+
+def _back_cb(kind: str, page: int) -> str:
+    return f"list:{kind}:{page}"
+
+
+def _parse_back(parts: List[str], start: int) -> Tuple[str, int]:
+    kind = parts[start] if len(parts) > start and parts[start] else "all"
+    try:
+        page = int(parts[start + 1]) if len(parts) > start + 1 else 0
+    except ValueError:
+        page = 0
+    return kind, page
+
+
+def _plural_sites(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} сайт"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} сайта"
+    return f"{n} сайтов"
+
+
+# ==================== Экраны ====================
+
+def dashboard_screen(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    sites = _visible_sites(user_id)
+    states = _database.get_all_states() if _database else {}
+    down = [s for s in sites if _is_down(states.get(s.id))]
+    up_count = len(sites) - len(down)
+    muted = _database.get_user_mutes(user_id) if _database else []
+    last_check = max((st.last_check_at or "" for st in states.values()), default="")
+
+    lines = ["🌐 <b>Мониторинг сайтов</b>"]
+    if not sites:
+        lines.append("")
+        lines.append("Вы пока не подписаны ни на один сайт. Найдите сайт через 🔎 Поиск и нажмите «Подписаться».")
+    else:
+        summary = f"🟢 {up_count} в порядке · 🔴 {len(down)} недоступн{'ы' if len(down) == 1 else 'о'}"
+        if muted:
+            summary += f" · 🔇 {len(muted)} заглуш."
+        lines.append(summary)
+        interval = _config.scheduler.interval_minutes if _config else 5
+        lines.append(f"Проверка каждые {interval} мин, последняя: {_hhmm(last_check)}")
+        if down:
+            lines.append("")
+            for s in sorted(down, key=lambda x: states[x.id].last_status_change or "")[:MAX_DOWN_ON_DASHBOARD]:
+                st = states[s.id]
+                lines.append(f"🔴 <b>{_esc(s.name)}</b> · {_ago(st.last_status_change)} · {_esc(_short_error(st))}")
+            if len(down) > MAX_DOWN_ON_DASHBOARD:
+                lines.append(f"… и ещё {len(down) - MAX_DOWN_ON_DASHBOARD}")
+
+    rows: List[List[Tuple[str, str]]] = []
+    first_row = []
+    if down:
+        first_row.append((f"🔴 Проблемы ({len(down)})", _back_cb("down", 0)))
+    first_row.append((f"📋 {'Все' if _is_admin(user_id) else 'Мои'} сайты ({len(sites)})", _back_cb("all", 0)))
+    rows.append(first_row)
+
+    if _is_admin(user_id) and sites:
+        group_row = []
+        for g in KNOWN_GROUPS:
+            n = sum(1 for s in sites if g in s.groups)
+            if n:
+                group_row.append((f"{group_emoji(g)} {group_title(g)} {n}", _back_cb(f"g_{g}", 0)))
+            if len(group_row) == 2:
+                rows.append(group_row)
+                group_row = []
+        if group_row:
+            rows.append(group_row)
+
+    rows.append([("🔄 Проверить всё", "checkall"), ("🔎 Поиск", "search")])
+    if muted:
+        rows.append([(f"🔇 Заглушенные ({len(muted)})", _back_cb("muted", 0))])
+    if _is_admin(user_id):
+        rows.append([("➕ Добавить сайт", "add"), ("📓 Журнал", "changes"), ("👑 Админы", "admins")])
+    rows.append([("🆔 Мой ID", "myid"), ("ℹ️ Справка", "help"), ("↻ Обновить", "dash")])
+    return "\n".join(lines), _kb(rows)
+
+
+def list_screen(user_id: int, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    title, sites = _resolve_list(kind, user_id)
+    states = _database.get_all_states() if _database else {}
+    sites = sorted(sites, key=lambda s: (not _is_down(states.get(s.id)), s.name.lower()))
+    total = len(sites)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = sites[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    down_n = sum(1 for s in sites if _is_down(states.get(s.id)))
+    head = f"<b>{_esc(title)}</b> · {_plural_sites(total)}"
+    if down_n:
+        head += f" · 🔴 {down_n}"
+    if pages > 1:
+        head += f" · стр. {page + 1}/{pages}"
+    text = head if chunk else head + "\n\nПусто."
+
+    rows: List[List[Tuple[str, str]]] = []
+    for s in chunk:
+        rows.append([(_site_button_text(s, states.get(s.id)), f"site:{s.id}:{kind}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(("◀️", _back_cb(kind, page - 1)))
+    if pages > 1:
+        nav.append((f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(("▶️", _back_cb(kind, page + 1)))
+    if nav:
+        rows.append(nav)
+    rows.append([("🏠 Меню", "dash")])
+    return text, _kb(rows)
+
+
+def site_screen(user_id: int, site: SiteConfig, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    st = _state(site.id)
+    is_admin = _is_admin(user_id)
+    muted = _database.is_muted(user_id, site.id) if _database else False
+    subscribed = user_id in site.notify_users
+
+    if _is_down(st):
+        head = f"🔴 <b>{_esc(site.name)}</b>"
+        status_line = f"Недоступен {_ago(st.last_status_change)}, с {_hhmm(st.last_status_change)}"
+        if st.last_error:
+            status_line += f"\n⚠️ {_esc(st.last_error)}"
+    else:
+        head = f"🟢 <b>{_esc(site.name)}</b>"
+        since = f" уже {_ago(st.last_status_change)}" if st and st.last_status_change else ""
+        status_line = f"В порядке{since}"
+    lines = [head, _esc(site.url), f"Группы: {_esc(groups_label(site.groups))}", status_line]
+
+    if st and st.last_check_at:
+        check = f"Последняя проверка: {_hhmm(st.last_check_at)}"
+        if st.last_status_code is not None:
+            check += f" · код {st.last_status_code}"
+        if st.last_response_ms is not None:
+            check += f" · {st.last_response_ms} мс"
+        if st.last_ip:
+            check += f" · {st.last_ip}"
+        lines.append(check)
+    if site.check_ssl and st and st.ssl_expiry:
+        try:
+            exp = parse_datetime(st.ssl_expiry)
+            days = (exp - now_izhevsk()).days
+            ssl_line = f"SSL: {_esc(st.ssl_issuer or '')}, до {exp.strftime('%d.%m.%Y')} ({days} дн.)"
+            if st.ssl_auto_renew:
+                ssl_line += ", автопродление"
+            if days <= 3:
+                ssl_line = "🔐 " + ssl_line
+            lines.append(ssl_line)
+        except Exception:
+            pass
+    elif not site.check_ssl:
+        lines.append("SSL: не проверяется")
+    if _database:
+        stats = _database.get_site_stats(site.id)
+        lines.append(f"Аптайм 30 дн: {stats.uptime_30d:g}% · инцидентов: {stats.incidents_30d}")
+    extra = []
+    if not site.check_http_code:
+        extra.append("код не проверяется")
+    elif site.expected_code != 200:
+        extra.append(f"ожидаемый код {site.expected_code}")
+    if site.keywords:
+        extra.append(f"слова: {', '.join(site.keywords)}")
+    if extra:
+        lines.append("Настройки: " + _esc("; ".join(extra)))
+    subs = f"Подписчики TG: {len(site.notify_users)}"
+    if subscribed:
+        subs += " (вы подписаны)"
+    if muted:
+        subs += " · 🔇 вы заглушили"
+    lines.append(subs)
+
+    nav = f"{kind}:{page}"
+    rows: List[List[Tuple[str, str]]] = [[("🔄 Проверить", f"chk:{site.id}:{nav}"), ("📈 История", f"hist:{site.id}:{nav}")]]
+    row2 = []
+    if _is_down(st):
+        row2.append(("🔔 Включить напоминания", f"unmute:{site.id}:{nav}") if muted else ("🔇 Заглушить", f"mute:{site.id}:{nav}"))
+    row2.append(("🔕 Отписаться", f"unsub:{site.id}:{nav}") if subscribed else ("🔔 Подписаться", f"sub:{site.id}:{nav}"))
+    rows.append(row2)
+    if is_admin:
+        rows.append([("🏷 Группы", f"grps:{site.id}:{nav}"), ("✏️ Изменить", f"edit:{site.id}:{nav}")])
+        rows.append([("👥 Подписчики", f"subs:{site.id}:{nav}"), ("🗑 Удалить", f"del:{site.id}:{nav}")])
+    rows.append([("◀️ К списку", _back_cb(kind, page)), ("🏠 Меню", "dash")])
+    return "\n".join(lines), _kb(rows)
+
+
+def history_screen(site: SiteConfig, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    stats = _database.get_site_stats(site.id)
+    incidents = _database.get_site_incidents(site.id, days=30, limit=10)
+    lines = [
+        f"📈 <b>{_esc(site.name)}</b>: история за 30 дней",
+        f"Аптайм: 7 дн {stats.uptime_7d:g}% · 30 дн {stats.uptime_30d:g}%",
+        f"Инцидентов: {stats.incidents_30d}"
+        + (f" · средний простой {format_duration(stats.avg_downtime_seconds)}" if stats.avg_downtime_seconds else ""),
+    ]
+    if incidents:
+        lines.append("")
+        for inc in incidents:
+            dur = format_duration(inc.duration_seconds) if inc.duration_seconds else "идёт"
+            reason = _SHORT_ERRORS.get(inc.error_type or "", inc.error_type or "")
+            lines.append(f"• {_hhmm(inc.started_at)} · {dur} · {_esc(reason)}")
+    else:
+        lines.append("\nИнцидентов не было.")
+    return "\n".join(lines), _kb([[("◀️ К сайту", f"site:{site.id}:{kind}:{page}"), ("🏠 Меню", "dash")]])
+
+
+def groups_screen(site: SiteConfig, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    text = (f"🏷 <b>{_esc(site.name)}</b>: группы\n\nСейчас: {_esc(groups_label(site.groups))}\n"
+            f"Нажмите, чтобы включить или выключить.")
+    all_groups = list(KNOWN_GROUPS) + [g for g in site.groups if g not in KNOWN_GROUPS]
+    rows = []
+    for g in all_groups:
+        mark = "✅" if g in site.groups else "▫️"
+        rows.append([(f"{mark} {group_label(g)}", f"grp:{site.id}:{g}:{kind}:{page}")])
+    rows.append([("✔️ Готово", f"site:{site.id}:{kind}:{page}")])
+    return text, _kb(rows)
+
+
+def edit_screen(site: SiteConfig, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    nav = f"{kind}:{page}"
+    text = f"✏️ <b>{_esc(site.name)}</b>: настройки\nВыберите, что изменить."
+    rows = [
+        [(f"Название: {site.name}", f"ef:{site.id}:name:{nav}")],
+        [(f"URL: {site.url}", f"ef:{site.id}:url:{nav}")],
+        [(f"Ожидаемый код: {site.expected_code}", f"ef:{site.id}:expected_code:{nav}"),
+         (f"Проверка кода: {'вкл' if site.check_http_code else 'выкл'}", f"tgl:{site.id}:check_http_code:{nav}")],
+        [(f"Ключевые слова: {', '.join(site.keywords) if site.keywords else 'нет'}", f"ef:{site.id}:keywords:{nav}")],
+        [(f"Проверка SSL: {'вкл' if site.check_ssl else 'выкл'}", f"tgl:{site.id}:check_ssl:{nav}")],
+        [("◀️ К сайту", f"site:{site.id}:{nav}")],
+    ]
+    return text, _kb(rows)
+
+
+def subs_screen(site: SiteConfig, kind: str, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    nav = f"{kind}:{page}"
+    lines = [f"👥 <b>{_esc(site.name)}</b>: подписчики Telegram",
+             "Админы получают уведомления по всем сайтам всегда."]
+    rows = []
+    for uid in site.notify_users:
+        user = _database.get_user(uid) if _database else None
+        name = (user.full_name or user.username) if user else None
+        label = f"{name} ({uid})" if name else str(uid)
+        rows.append([(f"➖ {label}", f"unsubu:{site.id}:{uid}:{nav}")])
+    if not site.notify_users:
+        lines.append("\nПодписчиков нет.")
+    rows.append([("➕ Добавить по ID", f"subadd:{site.id}:{nav}")])
+    rows.append([("◀️ К сайту", f"site:{site.id}:{nav}")])
+    return "\n".join(lines), _kb(rows)
+
+
+def admins_screen() -> Tuple[str, InlineKeyboardMarkup]:
+    lines = ["👑 <b>Администраторы</b>", "Видят все сайты, получают все уведомления, управляют списком."]
+    rows = []
+    for uid in _config.telegram.admin_ids:
+        user = _database.get_user(uid) if _database else None
+        name = (user.full_name or user.username) if user else None
+        label = f"{name} ({uid})" if name else str(uid)
+        rows.append([(f"➖ {label}", f"admdel:{uid}")])
+    rows.append([("➕ Добавить по ID", "admadd")])
+    rows.append([("🏠 Меню", "dash")])
+    return "\n".join(lines), _kb(rows)
+
+
+HELP_TEXT = (
+    "ℹ️ <b>Как пользоваться</b>\n\n"
+    "/start - главный экран со сводкой\n"
+    "/down - что сейчас лежит\n"
+    "/check [сайт] - проверить все сайты или один\n"
+    "/find текст - найти сайт по имени или адресу\n"
+    "/add ссылка [группы] - добавить сайт (админ), например: <code>/add shop.ru hosting vip</code>\n"
+    "/mute сайт, /unmute сайт - напоминания о падении для себя\n"
+    "/changes - журнал изменений (админ)\n"
+    "/myid - ваш Telegram ID\n\n"
+    "Любой текст без команды - поиск по сайтам.\n"
+    "Уведомления о падении и восстановлении приходят подписчикам сайта и админам. "
+    "Подписаться можно кнопкой в карточке сайта."
+)
+
+ADD_PROMPT = (
+    "➕ <b>Добавление сайта</b>\n\nПришлите ссылку (можно несколько, каждую с новой строки). "
+    "Рядом можно указать группы: <code>shop.ru hosting vip</code>.\n"
+    "Без группы сайт попадёт в «Стандарт»."
+)
 
 
 # ==================== Команды ====================
 
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    """Обработчик команды /start."""
-    user_id = message.from_user.id
-    username = message.from_user.username
-    full_name = message.from_user.full_name or "Пользователь"
-
-    # Регистрируем пользователя в базе
+@router.message(Command("start", "menu", "status", "status_all", "my_sites", "sites"))
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = message.from_user
     if _database:
-        is_new = _database.register_user(user_id, username, full_name)
-        if is_new:
-            logger.info(f"Новый пользователь зарегистрирован: {user_id} (@{username})")
+        if _database.register_user(user.id, user.username, user.full_name):
+            logger.info(f"Новый пользователь: {user.id} (@{user.username})")
+    text, kb = dashboard_screen(user.id)
+    await _show(message, text, kb)
 
-    role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
 
-    await message.answer(
-        f"👋 Привет, {full_name}!\n\n"
-        f"🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"🔑 Роль: {role}\n\n"
-        f"Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=_main_menu_keyboard(user_id)
-    )
+@router.message(Command("down"))
+async def cmd_down(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = list_screen(message.from_user.id, "down", 0)
+    await _show(message, text, kb)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await _show(message, HELP_TEXT, _kb([[("🏠 Меню", "dash")]]))
 
 
 @router.message(Command("myid"))
 async def cmd_myid(message: Message) -> None:
-    """Обработчик команды /myid."""
-    user_id = message.from_user.id
-    await message.answer(
-        f"🆔 Ваш Telegram ID: <code>{user_id}</code>",
-        parse_mode="HTML"
-    )
+    await message.answer(f"🆔 Ваш Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
-@router.message(Command("my_sites"))
-async def cmd_my_sites(message: Message) -> None:
-    """Обработчик команды /my_sites."""
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
+@router.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject, state: FSMContext) -> None:
+    await state.clear()
+    query = (command.args or "").strip()
+    if not query:
+        await state.set_state(SearchStates.waiting_query)
+        await message.answer("🔎 Введите часть названия или адреса сайта:")
         return
+    text, kb = list_screen(message.from_user.id, f"q_{_clean_query(query)}", 0)
+    await _show(message, text, kb)
 
-    user_id = message.from_user.id
 
-    # Админы видят все сайты, остальные — только свои
-    if _is_admin(user_id):
-        sites = _config.sites
-        title = "📋 <b>Все сайты:</b>\n"
-    else:
-        sites = get_sites_for_user(_config, user_id)
-        title = "📋 <b>Ваши сайты:</b>\n"
-
-    if not sites:
-        await message.answer(
-            "📋 Вы не подписаны на уведомления ни одного сайта.\n\n"
-            "Попросите администратора добавить ваш ID в подписчики."
-        )
+@router.message(Command("check", "check_now"))
+async def cmd_check(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if arg:
+        site = _find_site(arg, message.from_user.id)
+        if not site:
+            await message.answer(f"Сайт «{_esc(arg)}» не найден. Попробуйте /find {_esc(arg)}", parse_mode="HTML")
+            return
+        line = await _scheduler.check_single_site(site.id) if _scheduler else "планировщик не запущен"
+        await message.answer(_esc(line), reply_markup=_kb([[("📄 Карточка", f"site:{site.id}:all:0")]]))
         return
-
-    lines = [title]
-    for site in sites:
-        state = _database.get_state(site.id) if _database else None
-        status_emoji = "🟢" if (state and state.status == "UP") else "🔴"
-        status_text = state.status if state else "N/A"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b>\n"
-            f"   URL: {site.url}\n"
-            f"   Статус: {status_text}\n"
-            f"   Поддержка: {site.support_level}\n"
-        )
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("status_all"))
-async def cmd_status_all(message: Message) -> None:
-    """Обработчик команды /status_all (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+    if not _is_admin(message.from_user.id):
+        await message.answer("Проверить все сайты может только администратор. Укажите сайт: /check имя")
         return
+    await _run_check_all(message)
 
-    if _config is None or _database is None:
-        await message.answer("❌ Конфигурация или состояние не загружены")
+
+@router.message(Command("add", "add_site"))
+async def cmd_add(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await message.answer("❌ Добавлять сайты может только администратор")
         return
-
-    lines = ["📊 <b>Статус всех сайтов:</b>\n"]
-
-    for site in _config.sites:
-        state = _database.get_state(site.id)
-        status_emoji = "🟢" if state.status == "UP" else "🔴"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b> ({site.id})\n"
-            f"   URL: {site.url}\n"
-            f"   Статус: {state.status}\n"
-            f"   Неудачных проверок подряд: {state.fail_streak}\n"
-        )
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("check_now"))
-async def cmd_check_now(message: Message) -> None:
-    """Обработчик команды /check_now (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+    args = (command.args or "").strip()
+    if not args:
+        await state.set_state(AddStates.waiting_urls)
+        await message.answer(ADD_PROMPT, parse_mode="HTML", reply_markup=_kb([[("✖️ Отмена", "dash")]]))
         return
+    await _add_sites_from_text(message, args)
 
-    if _config is None or _database is None or _notifier is None:
-        await message.answer("❌ Система не полностью инициализирована")
+
+@router.message(Command("mute", "unmute"))
+async def cmd_mute(message: Message, command: CommandObject) -> None:
+    mute = (message.text or "").lstrip("/").split()[0].lower().startswith("mute")
+    arg = (command.args or "").strip()
+    site = _find_site(arg, message.from_user.id) if arg else None
+    if not site:
+        await message.answer(f"Укажите сайт: /{'mute' if mute else 'unmute'} имя")
         return
-
-    await message.answer("⏳ Запускаю проверку всех сайтов...")
-
-    try:
-        report = await run_immediate_check(_config, _database, _notifier)
-        await message.answer(
-            f"📋 <b>Результаты проверки:</b>\n\n{report}",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при мгновенной проверке: {e}")
-        await message.answer(f"❌ Ошибка при проверке: {e}")
-
-
-@router.message(Command("sites"))
-async def cmd_sites(message: Message) -> None:
-    """Обработчик команды /sites (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
-        return
-
-    await message.answer(
-        "📋 <b>Управление сайтами</b>\n\n"
-        f"Всего сайтов: {len(_config.sites)}",
-        parse_mode="HTML",
-        reply_markup=_sites_list_keyboard()
-    )
+    await message.answer(_toggle_mute(message.from_user.id, site, mute))
 
 
 @router.message(Command("changes"))
 async def cmd_changes(message: Message) -> None:
-    """Обработчик команды /changes: журнал изменений конфигурации (только админы)."""
     if not _is_admin(message.from_user.id):
-        await message.answer("❌ Эта команда доступна только администраторам")
+        await message.answer("❌ Только для администраторов")
         return
-
-    entries = read_changes(20, _config_path)
-    if not entries:
-        await message.answer("📓 Журнал изменений пуст")
-        return
-
-    body = "\n".join(
-        e.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for e in entries
-    )
-    text = f"📓 <b>Журнал изменений</b> (последние {len(entries)})\n\n<code>{body}</code>"
-    if len(text) > 4000:
-        text = text[:3990] + "…</code>"
-    await message.answer(text, parse_mode="HTML")
-
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    """Обработчик команды /stats (только админы)."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    if _config is None or _database is None:
-        await message.answer("❌ Система не инициализирована")
-        return
-
-    # Показываем список сайтов для выбора
-    buttons = []
-    for site in _config.sites:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📊 {site.name}",
-                callback_data=f"site_stats:{site.id}"
-            )
-        ])
-
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
-
-    await message.answer(
-        "📊 <b>Статистика сайтов</b>\n\n"
-        "Выберите сайт для просмотра статистики:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-
-
-@router.message(Command("muted"))
-async def cmd_muted(message: Message) -> None:
-    """Обработчик команды /muted - список заглушенных сайтов."""
-    user_id = message.from_user.id
-
-    if _database is None or _config is None:
-        await message.answer("❌ Система не инициализирована")
-        return
-
-    muted_sites = _database.get_user_mutes(user_id)
-
-    if not muted_sites:
-        await message.answer("🔔 У вас нет заглушенных сайтов.")
-        return
-
-    lines = ["🔇 <b>Заглушенные сайты:</b>\n"]
-    buttons = []
-
-    for site_id in muted_sites:
-        site = get_site_by_id(_config, site_id)
-        if site:
-            lines.append(f"• {site.name}")
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"🔔 Включить {site.name}",
-                    callback_data=f"unmute_site:{site_id}"
-                )
-            ])
-
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
-
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    await _show(message, _changes_text(), _kb([[("🏠 Меню", "dash")]]))
 
 
 @router.message(Command("admins"))
 async def cmd_admins(message: Message) -> None:
-    """Показывает список администраторов."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
-        return
-
-    lines = ["👑 <b>Администраторы:</b>\n"]
-    for admin_id in _config.telegram.admin_ids:
-        # Попробуем получить информацию из базы
-        user_info = _database.get_user(admin_id) if _database else None
-        if user_info:
-            name = user_info.full_name or user_info.username or str(admin_id)
-            lines.append(f"• {name} (<code>{admin_id}</code>)")
-        else:
-            lines.append(f"• <code>{admin_id}</code>")
-
-    lines.append(f"\nВсего: {len(_config.telegram.admin_ids)}")
-    lines.append("\n<i>Добавить: /add_admin ID\nУдалить: /remove_admin ID</i>")
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("add_admin"))
-async def cmd_add_admin(message: Message) -> None:
-    """Добавляет нового администратора."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
-        return
-
-    # Парсим аргументы
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Укажите Telegram ID пользователя\n\n"
-            "Пример: <code>/add_admin 123456789</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        new_admin_id = int(args[1].strip())
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-
-    if new_admin_id in _config.telegram.admin_ids:
-        await message.answer("ℹ️ Этот пользователь уже администратор")
-        return
-
-    if add_admin(_config, new_admin_id, _config_path):
-        # Получаем имя если есть в базе
-        user_info = _database.get_user(new_admin_id) if _database else None
-        name = ""
-        if user_info:
-            name = f" ({user_info.full_name or user_info.username})"
-
-        await message.answer(
-            f"✅ Администратор добавлен: <code>{new_admin_id}</code>{name}",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer("❌ Не удалось добавить администратора")
-
-
-@router.message(Command("remove_admin"))
-async def cmd_remove_admin(message: Message) -> None:
-    """Удаляет администратора."""
-    user_id = message.from_user.id
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    if _config is None:
-        await message.answer("❌ Конфигурация не загружена")
-        return
-
-    # Парсим аргументы
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Укажите Telegram ID администратора\n\n"
-            "Пример: <code>/remove_admin 123456789</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        admin_to_remove = int(args[1].strip())
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-
-    if admin_to_remove not in _config.telegram.admin_ids:
-        await message.answer("ℹ️ Этот пользователь не является администратором")
-        return
-
-    if len(_config.telegram.admin_ids) <= 1:
-        await message.answer("❌ Нельзя удалить последнего администратора")
-        return
-
-    if remove_admin(_config, admin_to_remove, _config_path):
-        await message.answer(
-            f"✅ Администратор удалён: <code>{admin_to_remove}</code>",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer("❌ Не удалось удалить администратора")
-
-
-# ==================== Callback handlers для меню ====================
-
-@router.callback_query(F.data == "menu_main")
-async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    """Возврат в главное меню."""
-    await state.clear()
-
-    user_id = callback.from_user.id
-    full_name = callback.from_user.full_name or "Пользователь"
-    role = "👑 Администратор" if _is_admin(user_id) else "👤 Пользователь"
-
-    await callback.message.edit_text(
-        f"👋 Привет, {full_name}!\n\n"
-        f"🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"🔑 Роль: {role}\n\n"
-        f"Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=_main_menu_keyboard(user_id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_myid")
-async def callback_menu_myid(callback: CallbackQuery, state: FSMContext) -> None:
-    """Показать ID через меню."""
-    await state.clear()
-    user_id = callback.from_user.id
-    await callback.message.edit_text(
-        f"🆔 Ваш Telegram ID:\n\n<code>{user_id}</code>\n\n"
-        f"Используйте этот ID для добавления в подписчики сайтов.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_my_sites")
-async def callback_menu_my_sites(callback: CallbackQuery, state: FSMContext) -> None:
-    """Мои сайты через меню."""
-    await state.clear()
-    if _config is None:
-        await callback.answer("❌ Конфигурация не загружена", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-
-    # Админы видят все сайты
-    if _is_admin(user_id):
-        sites = _config.sites
-        title = "📋 <b>Все сайты:</b>\n"
-    else:
-        sites = get_sites_for_user(_config, user_id)
-        title = "📋 <b>Мои сайты:</b>\n"
-
-    if not sites:
-        await callback.message.edit_text(
-            "📋 <b>Мои сайты</b>\n\n"
-            "Вы не подписаны на уведомления ни одного сайта.\n\n"
-            "Попросите администратора добавить ваш ID в подписчики.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-        await callback.answer()
-        return
-
-    lines = [title]
-    for site in sites:
-        site_state = _database.get_state(site.id) if _database else None
-        status_emoji = "🟢" if (site_state and site_state.status == "UP") else "🔴"
-        status_text = site_state.status if site_state else "N/A"
-
-        # Проверяем, заглушен ли сайт
-        muted_str = ""
-        if _database and site_state and site_state.status == "DOWN":
-            if _database.is_muted(user_id, site.id):
-                muted_str = " 🔇"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b>{muted_str}\n"
-            f"   Статус: {status_text} | Поддержка: {site.support_level}\n"
-        )
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_muted")
-async def callback_menu_muted(callback: CallbackQuery, state: FSMContext) -> None:
-    """Список заглушенных сайтов через меню."""
-    await state.clear()
-    user_id = callback.from_user.id
-
-    if _database is None or _config is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    muted_sites = _database.get_user_mutes(user_id)
-
-    if not muted_sites:
-        await callback.message.edit_text(
-            "🔔 У вас нет заглушенных сайтов.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-        await callback.answer()
-        return
-
-    lines = ["🔇 <b>Заглушенные сайты:</b>\n"]
-    buttons = []
-
-    for site_id in muted_sites:
-        site = get_site_by_id(_config, site_id)
-        if site:
-            lines.append(f"• {site.name}")
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"🔔 Включить {site.name}",
-                    callback_data=f"unmute_site:{site_id}"
-                )
-            ])
-
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_admins")
-async def callback_menu_admins(callback: CallbackQuery, state: FSMContext) -> None:
-    """Управление администраторами через меню."""
-    await state.clear()
-    user_id = callback.from_user.id
-
-    if not _is_admin(user_id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    if _config is None:
-        await callback.answer("❌ Конфигурация не загружена", show_alert=True)
-        return
-
-    lines = ["👑 <b>Администраторы:</b>\n"]
-    buttons = []
-
-    for admin_id in _config.telegram.admin_ids:
-        # Получаем информацию из базы
-        user_info = _database.get_user(admin_id) if _database else None
-        if user_info:
-            name = user_info.full_name or user_info.username or str(admin_id)
-            lines.append(f"• {name} (<code>{admin_id}</code>)")
-        else:
-            lines.append(f"• <code>{admin_id}</code>")
-
-        # Кнопка удаления (кроме себя и если админов больше 1)
-        if admin_id != user_id and len(_config.telegram.admin_ids) > 1:
-            btn_name = user_info.full_name[:15] if user_info and user_info.full_name else str(admin_id)
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"❌ Удалить {btn_name}",
-                    callback_data=f"remove_admin:{admin_id}"
-                )
-            ])
-
-    lines.append(f"\nВсего: {len(_config.telegram.admin_ids)}")
-
-    buttons.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin_start")])
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")])
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("remove_admin:"))
-async def callback_remove_admin(callback: CallbackQuery) -> None:
-    """Удаление администратора через меню."""
-    user_id = callback.from_user.id
-
-    if not _is_admin(user_id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    admin_to_remove = int(callback.data.split(":")[1])
-
-    if remove_admin(_config, admin_to_remove, _config_path):
-        await callback.answer("✅ Администратор удалён", show_alert=True)
-        # Обновляем список
-        await callback_menu_admins(callback, None)
-    else:
-        await callback.answer("❌ Не удалось удалить", show_alert=True)
-
-
-class AddAdminStates(StatesGroup):
-    """Состояния для добавления админа."""
-    waiting_for_id = State()
-
-
-@router.callback_query(F.data == "add_admin_start")
-async def callback_add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Начало добавления администратора."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    await state.set_state(AddAdminStates.waiting_for_id)
-
-    await callback.message.edit_text(
-        "👑 <b>Добавление администратора</b>\n\n"
-        "Введите Telegram ID нового администратора:\n\n"
-        "<i>Пользователь может узнать свой ID через /myid</i>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_admins")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.message(StateFilter(AddAdminStates.waiting_for_id))
-async def process_add_admin_id(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода ID нового админа."""
     if not _is_admin(message.from_user.id):
         await message.answer("❌ Только для администраторов")
         return
+    text, kb = admins_screen()
+    await _show(message, text, kb)
 
-    try:
-        new_admin_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:")
-        return
 
-    if new_admin_id in _config.telegram.admin_ids:
-        await message.answer("ℹ️ Этот пользователь уже администратор")
-        await state.clear()
-        return
-
-    if add_admin(_config, new_admin_id, _config_path):
-        user_info = _database.get_user(new_admin_id) if _database else None
-        name = ""
-        if user_info:
-            name = f" ({user_info.full_name or user_info.username})"
-
-        await message.answer(
-            f"✅ Администратор добавлен: <code>{new_admin_id}</code>{name}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="👑 К списку админов", callback_data="menu_admins")],
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-    else:
-        await message.answer("❌ Не удалось добавить администратора")
-
-    await state.clear()
-
-
-@router.callback_query(F.data == "menu_status_all")
-async def callback_menu_status_all(callback: CallbackQuery, state: FSMContext) -> None:
-    """Статус всех сайтов через меню."""
-    await state.clear()
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    if _config is None or _database is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    lines = ["📊 <b>Статус всех сайтов:</b>\n"]
-
-    for site in _config.sites:
-        site_state = _database.get_state(site.id)
-        status_emoji = "🟢" if site_state.status == "UP" else "🔴"
-
-        lines.append(
-            f"{status_emoji} <b>{site.name}</b>\n"
-            f"   Статус: {site_state.status} | Ошибок подряд: {site_state.fail_streak}\n"
-        )
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_status_all")],
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_check_now")
-async def callback_menu_check_now(callback: CallbackQuery, state: FSMContext) -> None:
-    """Проверка всех сайтов через меню."""
-    await state.clear()
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    if _config is None or _database is None or _notifier is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    await callback.answer("⏳ Запускаю проверку...")
-
-    try:
-        report = await run_immediate_check(_config, _database, _notifier)
-        await callback.message.edit_text(
-            f"📋 <b>Результаты проверки:</b>\n\n{report}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data="menu_check_now")],
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при мгновенной проверке: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
-
-
-# ==================== Mute/Unmute handlers ====================
-
-@router.callback_query(F.data.startswith("mute_site:"))
-async def callback_mute_site(callback: CallbackQuery) -> None:
-    """Обработчик заглушения напоминаний."""
-    user_id = callback.from_user.id
-    site_id = callback.data.split(":")[1]
-
-    if _database is None or _config is None or _notifier is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    site = get_site_by_id(_config, site_id)
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    # Проверяем, что сайт действительно DOWN
-    state = _database.get_state(site_id)
-    if state.status != "DOWN":
-        await callback.answer("ℹ️ Сайт уже восстановлен", show_alert=True)
-        return
-
-    success = _database.mute_for_user(user_id, site_id)
-
-    if success:
-        await _notifier.send_mute_confirmation(user_id, site.name, site_id)
-        await callback.answer("🔇 Напоминания отключены")
-    else:
-        await callback.answer("ℹ️ Уже заглушено", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("unmute_site:"))
-async def callback_unmute_site(callback: CallbackQuery) -> None:
-    """Обработчик включения напоминаний."""
-    user_id = callback.from_user.id
-    site_id = callback.data.split(":")[1]
-
-    if _database is None or _config is None or _notifier is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    site = get_site_by_id(_config, site_id)
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    success = _database.unmute_for_user(user_id, site_id)
-
-    if success:
-        await _notifier.send_unmute_confirmation(user_id, site.name)
-        await callback.answer("🔔 Напоминания включены")
-    else:
-        await callback.answer("ℹ️ Не было заглушено", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("check_now:"))
-async def callback_check_now_single(callback: CallbackQuery) -> None:
-    """Обработчик мгновенной проверки из уведомления."""
-    site_id = callback.data.split(":")[1]
-
-    if _scheduler is None or _config is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    site = get_site_by_id(_config, site_id)
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    await callback.answer("⏳ Проверяю...")
-
-    result = await _scheduler.check_single_site(site_id)
-
-    if result:
-        await callback.message.answer(
-            f"🔍 <b>Результат проверки</b>\n\n{result}",
-            parse_mode="HTML"
-        )
-    else:
-        await callback.message.answer("❌ Не удалось выполнить проверку")
-
-
-# ==================== Статистика ====================
-
-@router.callback_query(F.data.startswith("site_stats:"))
-async def callback_site_stats(callback: CallbackQuery) -> None:
-    """Обработчик просмотра статистики сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-
-    if _database is None or _config is None:
-        await callback.answer("❌ Система не инициализирована", show_alert=True)
-        return
-
-    site = get_site_by_id(_config, site_id)
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    stats = _database.get_site_stats(site_id)
-
-    # Форматируем последний инцидент
-    last_incident_str = "—"
-    if stats.last_incident_at:
-        last_dt = parse_datetime(stats.last_incident_at)
-        delta = now_izhevsk() - last_dt
-        if delta.days > 0:
-            last_incident_str = f"{delta.days} дн. назад"
-        elif delta.seconds > 3600:
-            last_incident_str = f"{delta.seconds // 3600} ч. назад"
-        else:
-            last_incident_str = f"{delta.seconds // 60} мин. назад"
-
-    text = (
-        f"📊 <b>Статистика сайта {site.name}</b>\n\n"
-        f"Uptime за 7 дней: <b>{stats.uptime_7d}%</b>\n"
-        f"Uptime за 30 дней: <b>{stats.uptime_30d}%</b>\n"
-        f"Инцидентов за 30 дней: <b>{stats.incidents_30d}</b>\n"
-        f"Среднее время простоя: <b>{format_duration(stats.avg_downtime_seconds)}</b>\n"
-        f"Последний инцидент: <b>{last_incident_str}</b>"
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"site_stats:{site_id}")],
-            [InlineKeyboardButton(text="◀️ К сайту", callback_data=f"site_info:{site_id}")],
-            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-        ])
-    )
-    await callback.answer()
-
-
-# ==================== Управление сайтами ====================
-
-@router.callback_query(F.data == "sites_list")
-async def callback_sites_list(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик возврата к списку сайтов."""
-    await state.clear()
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "📋 <b>Управление сайтами</b>\n\n"
-        f"Всего сайтов: {len(_config.sites) if _config else 0}",
-        parse_mode="HTML",
-        reply_markup=_sites_list_keyboard()
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("sites_page:"))
-async def callback_sites_page(callback: CallbackQuery) -> None:
-    """Обработчик переключения страниц списка сайтов."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    page = int(callback.data.split(":")[1])
-    await callback.message.edit_reply_markup(reply_markup=_sites_list_keyboard(page))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("site_info:"))
-async def callback_site_info(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик просмотра информации о сайте."""
-    await state.clear()
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    site_state = _database.get_state(site_id) if _database else None
-    status_emoji = "🟢" if (site_state and site_state.status == "UP") else "🔴"
-    status_text = site_state.status if site_state else "N/A"
-
-    ssl_status = "✅" if site.check_ssl else "❌"
-    http_status = "✅" if site.check_http_code else "❌"
-    keywords_str = ", ".join(site.keywords) if site.keywords else "—"
-    users_str = ", ".join(str(u) for u in site.notify_users) if site.notify_users else "—"
-
-    text = (
-        f"{status_emoji} <b>{site.name}</b>\n\n"
-        f"🆔 ID: <code>{site.id}</code>\n"
-        f"🔗 URL: {site.url}\n"
-        f"⭐ Поддержка: {site.support_level}\n"
-        f"📊 Статус: {status_text}\n\n"
-        f"<b>Настройки проверок:</b>\n"
-        f"🔐 SSL: {ssl_status}\n"
-        f"📡 HTTP код: {http_status} (ожидается {site.expected_code})\n"
-        f"🔑 Ключевые слова: {keywords_str}\n\n"
-        f"👥 Подписчики: {users_str}"
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=_site_info_keyboard(site_id, callback.from_user.id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("check_site:"))
-async def callback_check_site(callback: CallbackQuery) -> None:
-    """Обработчик проверки конкретного сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    await callback.answer("⏳ Проверяю сайт...")
-
-    from .retry_logic import check_site_single
-    result = await check_site_single(site, _config.default, _config.ssl)
-
-    status = "✅ Доступен" if result.success else "❌ Недоступен"
-    code_str = f" (код {result.status_code})" if result.status_code else ""
-    time_str = f"\n⏱ Время ответа: {result.response_time_ms}ms" if result.response_time_ms else ""
-    error_str = f"\n⚠️ Ошибка: {result.error}" if result.error else ""
-
-    await callback.message.answer(
-        f"🔍 <b>Результат проверки</b>\n\n"
-        f"Сайт: {site.name}\n"
-        f"Статус: {status}{code_str}{time_str}{error_str}",
-        parse_mode="HTML"
-    )
-
-
-@router.callback_query(F.data.startswith("edit_site:"))
-async def callback_edit_site(callback: CallbackQuery) -> None:
-    """Обработчик редактирования сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        f"✏️ <b>Редактирование сайта</b>\n\n"
-        f"Сайт: {site.name}\n"
-        f"ID: {site.id}\n\n"
-        f"Выберите поле для редактирования:",
-        parse_mode="HTML",
-        reply_markup=_edit_site_keyboard(site_id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("edit_field:"))
-async def callback_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик выбора поля для редактирования."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    site_id = parts[1]
-    field = parts[2]
-
-    site = get_site_by_id(_config, site_id) if _config else None
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    field_names = {
-        "name": "название",
-        "url": "URL",
-        "support_level": "уровень поддержки",
-        "expected_code": "ожидаемый HTTP код",
-        "keywords": "ключевые слова"
-    }
-
-    if field == "support_level":
-        await callback.message.edit_text(
-            f"⭐ <b>Выберите уровень поддержки</b>\n\n"
-            f"Текущий: {site.support_level}",
-            parse_mode="HTML",
-            reply_markup=_support_level_keyboard(site_id)
-        )
-        await callback.answer()
-        return
-
-    await state.update_data(edit_site_id=site_id, edit_field=field)
-    await state.set_state(EditSiteStates.waiting_for_value)
-
-    current_value = getattr(site, field, "")
-    if field == "keywords":
-        current_value = ", ".join(site.keywords) if site.keywords else "—"
-
-    await callback.message.edit_text(
-        f"✏️ <b>Редактирование: {field_names.get(field, field)}</b>\n\n"
-        f"Текущее значение: {current_value}\n\n"
-        f"Введите новое значение:",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-
-@router.message(StateFilter(EditSiteStates.waiting_for_value))
-async def process_edit_value(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода нового значения поля."""
+@router.message(Command("add_admin", "remove_admin"))
+async def cmd_admin_change(message: Message, command: CommandObject) -> None:
     if not _is_admin(message.from_user.id):
         await message.answer("❌ Только для администраторов")
-        await state.clear()
         return
-
-    data = await state.get_data()
-
-    # Проверяем, добавляем ли ключевые слова
-    add_keyword_site_id = data.get("add_keyword_site_id")
-    if add_keyword_site_id:
-        site = get_site_by_id(_config, add_keyword_site_id) if _config else None
-        if not site:
-            await message.answer("❌ Сайт не найден")
-            await state.clear()
-            return
-
-        new_keywords = [k.strip() for k in message.text.strip().split(",") if k.strip()]
-        all_keywords = (site.keywords or []) + new_keywords
-        success = update_site(_config, add_keyword_site_id, _config_path, keywords=all_keywords)
-
-        if success:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.answer(
-                f"✅ Добавлено: {', '.join(new_keywords)}",
-                reply_markup=_keywords_keyboard(add_keyword_site_id)
-            )
-        else:
-            await message.answer("❌ Ошибка добавления")
-        await state.clear()
-        return
-
-    site_id = data.get("edit_site_id")
-    field = data.get("edit_field")
-
-    if not site_id or not field:
-        await message.answer("❌ Ошибка редактирования")
-        await state.clear()
-        return
-
-    value = message.text.strip()
-
-    if field == "expected_code":
-        try:
-            value = int(value)
-        except ValueError:
-            await message.answer("❌ Введите числовое значение HTTP кода")
-            return
-
-    success = update_site(_config, site_id, _config_path, **{field: value})
-
-    if success:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await message.answer(
-            f"✅ Поле успешно обновлено!",
-            reply_markup=_site_info_keyboard(site_id, message.from_user.id)
-        )
-    else:
-        await message.answer("❌ Не удалось обновить поле")
-
-    await state.clear()
-
-
-@router.callback_query(F.data.startswith("set_support:"))
-async def callback_set_support(callback: CallbackQuery) -> None:
-    """Обработчик установки уровня поддержки."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    site_id = parts[1]
-    level = parts[2]
-
-    success = update_site(_config, site_id, _config_path, support_level=level)
-
-    if success:
-        await callback.answer(f"✅ Уровень поддержки: {level}")
-        await callback.message.edit_text(
-            f"✅ Уровень поддержки обновлён: {level}",
-            reply_markup=_site_info_keyboard(site_id, callback.from_user.id)
-        )
-    else:
-        await callback.answer("❌ Ошибка обновления", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("toggle_ssl:"))
-async def callback_toggle_ssl(callback: CallbackQuery) -> None:
-    """Обработчик переключения проверки SSL."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    new_value = not site.check_ssl
-    success = update_site(_config, site_id, _config_path, check_ssl=new_value)
-
-    if success:
-        status = "включена" if new_value else "отключена"
-        await callback.answer(f"✅ Проверка SSL {status}")
-        await callback.message.edit_reply_markup(reply_markup=_edit_site_keyboard(site_id))
-    else:
-        await callback.answer("❌ Ошибка обновления", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("toggle_http:"))
-async def callback_toggle_http(callback: CallbackQuery) -> None:
-    """Обработчик переключения проверки HTTP кода."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    new_value = not site.check_http_code
-    success = update_site(_config, site_id, _config_path, check_http_code=new_value)
-
-    if success:
-        status = "включена" if new_value else "отключена"
-        await callback.answer(f"✅ Проверка HTTP кода {status}")
-        await callback.message.edit_reply_markup(reply_markup=_edit_site_keyboard(site_id))
-    else:
-        await callback.answer("❌ Ошибка обновления", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("edit_keywords:"))
-async def callback_edit_keywords(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик редактирования ключевых слов."""
-    await state.clear()
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    count = len(site.keywords) if site.keywords else 0
-    await callback.message.edit_text(
-        f"🔑 <b>Ключевые слова</b>\n\n"
-        f"Сайт: {site.name}\n"
-        f"Количество: {count}",
-        parse_mode="HTML",
-        reply_markup=_keywords_keyboard(site_id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("remove_kw:"))
-async def callback_remove_keyword(callback: CallbackQuery) -> None:
-    """Обработчик удаления ключевого слова."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    parts = callback.data.split(":", 2)
-    site_id = parts[1]
-    keyword = parts[2]
-
-    site = get_site_by_id(_config, site_id) if _config else None
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    new_keywords = [kw for kw in site.keywords if kw != keyword]
-    success = update_site(_config, site_id, _config_path, keywords=new_keywords)
-
-    if success:
-        await callback.answer(f"✅ Удалено: {keyword}")
-        count = len(new_keywords)
-        await callback.message.edit_text(
-            f"🔑 <b>Ключевые слова</b>\n\n"
-            f"Сайт: {site.name}\n"
-            f"Количество: {count}",
-            parse_mode="HTML",
-            reply_markup=_keywords_keyboard(site_id)
-        )
-    else:
-        await callback.answer("❌ Ошибка удаления", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("clear_keywords:"))
-async def callback_clear_keywords(callback: CallbackQuery) -> None:
-    """Обработчик очистки всех ключевых слов."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    success = update_site(_config, site_id, _config_path, keywords=[])
-
-    if success:
-        await callback.answer("✅ Все ключевые слова удалены")
-        await callback.message.edit_text(
-            f"🔑 <b>Ключевые слова</b>\n\n"
-            f"Сайт: {site.name}\n"
-            f"Количество: 0",
-            parse_mode="HTML",
-            reply_markup=_keywords_keyboard(site_id)
-        )
-    else:
-        await callback.answer("❌ Ошибка очистки", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("add_keyword:"))
-async def callback_add_keyword(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик добавления ключевого слова."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    await state.update_data(add_keyword_site_id=site_id)
-    await state.set_state(EditSiteStates.waiting_for_value)
-
-    await callback.message.edit_text(
-        "🔑 <b>Добавление ключевого слова</b>\n\n"
-        "Введите ключевое слово или несколько через запятую:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"edit_keywords:{site_id}")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("delete_site:"))
-async def callback_delete_site(callback: CallbackQuery) -> None:
-    """Обработчик запроса на удаление сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        f"🗑 <b>Удаление сайта</b>\n\n"
-        f"Вы уверены, что хотите удалить сайт?\n\n"
-        f"Название: {site.name}\n"
-        f"URL: {site.url}",
-        parse_mode="HTML",
-        reply_markup=_confirm_delete_keyboard(site_id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("confirm_delete:"))
-async def callback_confirm_delete(callback: CallbackQuery) -> None:
-    """Обработчик подтверждения удаления сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    success = remove_site(_config, site_id, _config_path)
-
-    if success:
-        await callback.answer("✅ Сайт удалён")
-        await callback.message.edit_text(
-            "✅ Сайт успешно удалён!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ К списку сайтов", callback_data="sites_list")]
-            ])
-        )
-    else:
-        await callback.answer("❌ Ошибка удаления", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("site_users:"))
-async def callback_site_users(callback: CallbackQuery) -> None:
-    """Обработчик просмотра подписчиков сайта."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    site = get_site_by_id(_config, site_id) if _config else None
-
-    if not site:
-        await callback.answer("❌ Сайт не найден", show_alert=True)
-        return
-
-    count = len(site.notify_users) if site.notify_users else 0
-    await callback.message.edit_text(
-        f"👥 <b>Подписчики сайта</b>\n\n"
-        f"Сайт: {site.name}\n"
-        f"Количество: {count}",
-        parse_mode="HTML",
-        reply_markup=_site_users_keyboard(site_id)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("add_user:"))
-async def callback_add_user(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик добавления подписчика."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    site_id = callback.data.split(":")[1]
-    await state.update_data(add_user_site_id=site_id)
-    await state.set_state(EditSiteStates.waiting_for_field)
-
-    await callback.message.edit_text(
-        "👤 <b>Добавление подписчика</b>\n\n"
-        "Введите Telegram ID пользователя:",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-
-@router.message(StateFilter(EditSiteStates.waiting_for_field))
-async def process_add_user(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода ID пользователя."""
-    if not _is_admin(message.from_user.id):
-        await message.answer("❌ Только для администраторов")
-        await state.clear()
-        return
-
-    data = await state.get_data()
-    site_id = data.get("add_user_site_id")
-
-    if not site_id:
-        await message.answer("❌ Ошибка")
-        await state.clear()
-        return
-
     try:
-        user_id = int(message.text.strip())
+        uid = int((command.args or "").strip())
     except ValueError:
-        await message.answer("❌ Введите числовой Telegram ID")
+        await message.answer("Укажите Telegram ID числом")
         return
-
-    success = add_notify_user(_config, site_id, user_id, _config_path)
-
-    if success:
-        await message.answer(
-            f"✅ Пользователь {user_id} добавлен в подписчики!",
-            reply_markup=_site_users_keyboard(site_id)
-        )
+    if (message.text or "").startswith("/add_admin"):
+        ok = add_admin(_config, uid, _config_path)
+        await message.answer("✅ Администратор добавлен" if ok else "Уже администратор")
     else:
-        await message.answer("❌ Не удалось добавить пользователя")
+        ok = remove_admin(_config, uid, _config_path)
+        await message.answer("✅ Администратор удалён" if ok else "Не удалось: не админ или последний админ")
 
+
+# ==================== Callback: навигация ====================
+
+@router.callback_query(F.data == "dash")
+async def cb_dash(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-
-
-@router.callback_query(F.data.startswith("remove_user:"))
-async def callback_remove_user(callback: CallbackQuery) -> None:
-    """Обработчик удаления подписчика."""
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("❌ Только для администраторов", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    site_id = parts[1]
-    user_id = int(parts[2])
-
-    success = remove_notify_user(_config, site_id, user_id, _config_path)
-
-    if success:
-        await callback.answer(f"✅ Пользователь {user_id} удалён")
-        await callback.message.edit_reply_markup(reply_markup=_site_users_keyboard(site_id))
-    else:
-        await callback.answer("❌ Ошибка удаления", show_alert=True)
-
-
-# ==================== Добавление сайта ====================
-
-@router.callback_query(F.data == "add_site")
-@router.message(Command("add_site"))
-async def cmd_add_site(event, state: FSMContext) -> None:
-    """Обработчик начала добавления сайта."""
-    if isinstance(event, CallbackQuery):
-        user_id = event.from_user.id
-        message = event.message
-        await event.answer()
-    else:
-        user_id = event.from_user.id
-        message = event
-
-    if not _is_admin(user_id):
-        await message.answer("❌ Эта команда доступна только администраторам")
-        return
-
-    await state.set_state(AddSiteStates.waiting_for_url)
-    await state.update_data(new_site={})
-
-    text = (
-        "➕ <b>Добавление нового сайта</b>\n\n"
-        "Шаг 1/3: Введите URL сайта\n\n"
-        "Пример: <code>example.com</code>"
-    )
-
-    if isinstance(event, CallbackQuery):
-        await message.edit_text(text, parse_mode="HTML")
-    else:
-        await message.answer(text, parse_mode="HTML")
-
-
-@router.message(StateFilter(AddSiteStates.waiting_for_url))
-async def process_site_url(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода URL сайта."""
-    url = message.text.strip()
-
-    # Добавляем https:// если не указан протокол
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    # Извлекаем домен и генерируем ID
-    domain = _extract_domain(url)
-    site_id = _generate_site_id(domain)
-
-    # Проверяем, не существует ли уже такой сайт
-    if get_site_by_id(_config, site_id):
-        await message.answer(
-            f"❌ Сайт с доменом {domain} уже существует",
-            parse_mode="HTML"
-        )
-        return
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["id"] = site_id
-    new_site["name"] = domain
-    new_site["url"] = url
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_support_level)
-
-    await message.answer(
-        f"✅ Сайт: <b>{domain}</b>\n\n"
-        "Выберите уровень поддержки:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🟡 Стандарт", callback_data="new_support:standard"),
-                InlineKeyboardButton(text="🟢 Премиум", callback_data="new_support:premium")
-            ]
-        ])
-    )
-
-
-@router.callback_query(F.data.startswith("new_support:"), StateFilter(AddSiteStates.waiting_for_support_level))
-async def process_new_support(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработчик выбора уровня поддержки для нового сайта."""
-    level = callback.data.split(":")[1]
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["support_level"] = level
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_keywords)
-
-    await callback.message.edit_text(
-        f"✅ Уровень поддержки: {level}\n\n"
-        "Шаг 2/3: Введите ключевые слова через запятую\n\n"
-        "Пример: <code>Welcome, Главная</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_keywords")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "new_skip_keywords", StateFilter(AddSiteStates.waiting_for_keywords))
-async def callback_skip_keywords(callback: CallbackQuery, state: FSMContext) -> None:
-    """Пропуск ключевых слов."""
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["keywords"] = []
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_notify_users)
-
-    await callback.message.edit_text(
-        "✅ Ключевые слова: —\n\n"
-        "Шаг 3/3: Введите Telegram ID для уведомлений\n\n"
-        "Пример: <code>123456789</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_notify")]
-        ])
-    )
-    await callback.answer()
-
-
-@router.message(StateFilter(AddSiteStates.waiting_for_keywords))
-async def process_keywords(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода ключевых слов."""
-    text = message.text.strip()
-    keywords = [k.strip() for k in text.split(",") if k.strip()]
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-    new_site["keywords"] = keywords
-    await state.update_data(new_site=new_site)
-    await state.set_state(AddSiteStates.waiting_for_notify_users)
-
-    keywords_str = ", ".join(keywords)
-    await message.answer(
-        f"✅ Ключевые слова: {keywords_str}\n\n"
-        "Шаг 3/3: Введите Telegram ID для уведомлений\n\n"
-        "Пример: <code>123456789</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="new_skip_notify")]
-        ])
-    )
-
-
-@router.callback_query(F.data == "new_skip_notify", StateFilter(AddSiteStates.waiting_for_notify_users))
-async def callback_skip_notify(callback: CallbackQuery, state: FSMContext) -> None:
-    """Пропуск подписчиков — завершение добавления."""
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-
-    site = SiteConfig(
-        id=new_site["id"],
-        name=new_site["name"],
-        url=new_site["url"],
-        support_level=new_site.get("support_level", "none"),
-        check_ssl=True,
-        check_http_code=True,
-        expected_code=200,
-        keywords=new_site.get("keywords", []),
-        notify_users=[]
-    )
-
-    if add_site(_config, site, _config_path):
-        await callback.message.edit_text(
-            f"✅ <b>Сайт добавлен!</b>\n\n"
-            f"Название: {site.name}\n"
-            f"URL: {site.url}\n"
-            f"Поддержка: {site.support_level}\n"
-            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: —\n\n"
-            f"⏳ Проверяю...",
-            parse_mode="HTML"
-        )
-        # Немедленная проверка
-        check_result = await _check_new_site(site)
-        await callback.message.edit_text(
-            f"✅ <b>Сайт добавлен!</b>\n\n"
-            f"Название: {site.name}\n"
-            f"URL: {site.url}\n"
-            f"Поддержка: {site.support_level}\n"
-            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: —\n\n"
-            f"<b>Первая проверка:</b> {check_result}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-    else:
-        await callback.message.edit_text("❌ Ошибка при добавлении сайта")
-
-    await state.clear()
-    await callback.answer()
-
-
-@router.message(StateFilter(AddSiteStates.waiting_for_notify_users))
-async def process_notify_users(message: Message, state: FSMContext) -> None:
-    """Обработчик ввода пользователей для уведомлений."""
-    text = message.text.strip()
-
-    try:
-        notify_users = [int(u.strip()) for u in text.split(",") if u.strip()]
-    except ValueError:
-        await message.answer("❌ Введите числовые Telegram ID через запятую")
-        return
-
-    if not notify_users:
-        await message.answer("❌ Введите хотя бы один Telegram ID")
-        return
-
-    data = await state.get_data()
-    new_site = data.get("new_site", {})
-
-    site = SiteConfig(
-        id=new_site["id"],
-        name=new_site["name"],
-        url=new_site["url"],
-        support_level=new_site.get("support_level", "none"),
-        check_ssl=True,
-        check_http_code=True,
-        expected_code=200,
-        keywords=new_site.get("keywords", []),
-        notify_users=notify_users
-    )
-
-    success = add_site(_config, site, _config_path)
-
-    if success:
-        status_msg = await message.answer(
-            f"✅ <b>Сайт добавлен!</b>\n\n"
-            f"Название: {site.name}\n"
-            f"URL: {site.url}\n"
-            f"Поддержка: {site.support_level}\n"
-            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: {', '.join(str(u) for u in notify_users)}\n\n"
-            f"⏳ Проверяю...",
-            parse_mode="HTML"
-        )
-        # Немедленная проверка
-        check_result = await _check_new_site(site)
-        await status_msg.edit_text(
-            f"✅ <b>Сайт добавлен!</b>\n\n"
-            f"Название: {site.name}\n"
-            f"URL: {site.url}\n"
-            f"Поддержка: {site.support_level}\n"
-            f"Ключевые слова: {', '.join(site.keywords) if site.keywords else '—'}\n"
-            f"Подписчики: {', '.join(str(u) for u in notify_users)}\n\n"
-            f"<b>Первая проверка:</b> {check_result}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
-            ])
-        )
-    else:
-        await message.answer("❌ Не удалось добавить сайт")
-
-    await state.clear()
+    text, kb = dashboard_screen(callback.from_user.id)
+    await _show(callback, text, kb)
 
 
 @router.callback_query(F.data == "noop")
-async def callback_noop(callback: CallbackQuery) -> None:
-    """Пустой обработчик."""
+async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# ==================== Setup ====================
+@router.callback_query(F.data == "help")
+async def cb_help(callback: CallbackQuery) -> None:
+    await _show(callback, HELP_TEXT, _kb([[("🏠 Меню", "dash")]]))
+
+
+@router.callback_query(F.data == "myid")
+async def cb_myid(callback: CallbackQuery) -> None:
+    await _show(callback, f"🆔 Ваш Telegram ID: <code>{callback.from_user.id}</code>\n\n"
+                          "Сообщите его администратору, чтобы вас добавили в подписчики, "
+                          "или подпишитесь сами в карточке сайта.", _kb([[("🏠 Меню", "dash")]]))
+
+
+@router.callback_query(F.data.startswith("list:"))
+async def cb_list(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    parts = callback.data.split(":")
+    kind, page = _parse_back(parts, 1)
+    text, kb = list_screen(callback.from_user.id, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("site:"))
+async def cb_site(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден (удалён?)", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    text, kb = site_screen(callback.from_user.id, site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("hist:"))
+async def cb_hist(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    text, kb = history_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+# ==================== Callback: действия с сайтом ====================
+
+@router.callback_query(F.data.startswith("chk:") | F.data.startswith("check_now:") | F.data.startswith("check_site:"))
+async def cb_check_site(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    await callback.answer("⏳ Проверяю...")
+    line = await _scheduler.check_single_site(site.id) if _scheduler else "планировщик не запущен"
+    kind, page = _parse_back(parts, 2)
+    if callback.data.startswith("chk:"):
+        text, kb = site_screen(callback.from_user.id, site, kind, page)
+        text += f"\n\n🔍 {_esc(line)}"
+        await _show(callback, text, kb)
+    else:
+        await callback.message.answer(_esc(line), reply_markup=_kb([[("📄 Карточка", f"site:{site.id}:all:0")]]))
+
+
+@router.callback_query(F.data.startswith("mute:") | F.data.startswith("unmute:")
+                       | F.data.startswith("mute_site:") | F.data.startswith("unmute_site:"))
+async def cb_mute(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    mute = parts[0] in ("mute", "mute_site")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    result = _toggle_mute(callback.from_user.id, site, mute)
+    if parts[0] in ("mute", "unmute"):
+        kind, page = _parse_back(parts, 2)
+        text, kb = site_screen(callback.from_user.id, site, kind, page)
+        await _show(callback, text, kb)
+        try:
+            await callback.answer(result)
+        except Exception:
+            pass
+    else:
+        await callback.answer(result, show_alert=True)
+
+
+@router.callback_query(F.data.startswith("sub:") | F.data.startswith("unsub:"))
+async def cb_subscribe(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    uid = callback.from_user.id
+    if parts[0] == "sub":
+        add_notify_user(_config, site.id, uid, _config_path)
+        note = "🔔 Вы подписаны на уведомления"
+    else:
+        remove_notify_user(_config, site.id, uid, _config_path)
+        note = "🔕 Подписка снята"
+    kind, page = _parse_back(parts, 2)
+    text, kb = site_screen(uid, site, kind, page)
+    await _show(callback, text, kb)
+    try:
+        await callback.answer(note)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("grps:"))
+async def cb_groups(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    text, kb = groups_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("grp:"))
+async def cb_group_toggle(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    g = parts[2]
+    groups = [x for x in site.groups if x != g] if g in site.groups else site.groups + [g]
+    update_site(_config, site.id, _config_path, groups=groups)
+    kind, page = _parse_back(parts, 3)
+    text, kb = groups_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("edit:"))
+async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    text, kb = edit_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("tgl:"))
+async def cb_toggle(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    field = parts[2]
+    if not site or field not in ("check_ssl", "check_http_code"):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    update_site(_config, site.id, _config_path, **{field: not getattr(site, field)})
+    kind, page = _parse_back(parts, 3)
+    text, kb = edit_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+_FIELD_PROMPTS = {
+    "name": "Введите новое название:",
+    "url": "Введите новый адрес (с http:// или https://):",
+    "expected_code": "Введите ожидаемый HTTP-код (например, 200 или 401):",
+    "keywords": "Введите ключевые слова через запятую (пусто или «нет» - убрать проверку слов):",
+}
+
+
+@router.callback_query(F.data.startswith("ef:"))
+async def cb_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    field = parts[2]
+    if not site or field not in _FIELD_PROMPTS:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 3)
+    await state.set_state(EditStates.waiting_value)
+    await state.update_data(site_id=site.id, field=field, kind=kind, page=page)
+    current = getattr(site, field)
+    if field == "keywords":
+        current = ", ".join(current) if current else "нет"
+    await _show(callback, f"✏️ <b>{_esc(site.name)}</b>\nСейчас: {_esc(current)}\n\n{_FIELD_PROMPTS[field]}",
+                _kb([[("✖️ Отмена", f"edit:{site.id}:{kind}:{page}")]]))
+
+
+@router.message(StateFilter(EditStates.waiting_value))
+async def msg_edit_value(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    site = get_site_by_id(_config, data.get("site_id", ""))
+    field = data.get("field")
+    if not site or not field:
+        await state.clear()
+        await message.answer("Сайт не найден")
+        return
+    raw = (message.text or "").strip()
+    value = raw
+    if field == "expected_code":
+        try:
+            value = int(raw)
+        except ValueError:
+            await message.answer("Нужно число, например 200")
+            return
+    elif field == "url":
+        if not raw.startswith(("http://", "https://")):
+            value = "https://" + raw
+        if not urlparse(value).hostname:
+            await message.answer("Не похоже на адрес сайта")
+            return
+    elif field == "keywords":
+        value = [k.strip() for k in raw.split(",") if k.strip()] if raw.lower() not in ("", "нет", "-") else []
+    update_site(_config, site.id, _config_path, **{field: value})
+    await state.clear()
+    text, kb = edit_screen(site, data.get("kind", "all"), int(data.get("page", 0)))
+    await message.answer("✅ Сохранено\n\n" + text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("subs:"))
+async def cb_subs(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    text, kb = subs_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("unsubu:"))
+async def cb_unsub_user(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    try:
+        remove_notify_user(_config, site.id, int(parts[2]), _config_path)
+    except ValueError:
+        pass
+    kind, page = _parse_back(parts, 3)
+    text, kb = subs_screen(site, kind, page)
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("subadd:"))
+async def cb_sub_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    await state.set_state(SubStates.waiting_user_id)
+    await state.update_data(site_id=site.id, kind=kind, page=page)
+    await _show(callback, f"👥 <b>{_esc(site.name)}</b>\nВведите Telegram ID подписчика (узнать: /myid):",
+                _kb([[("✖️ Отмена", f"subs:{site.id}:{kind}:{page}")]]))
+
+
+@router.message(StateFilter(SubStates.waiting_user_id))
+async def msg_sub_add(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    site = get_site_by_id(_config, data.get("site_id", ""))
+    try:
+        uid = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно число, например 123456789")
+        return
+    if not site:
+        await state.clear()
+        await message.answer("Сайт не найден")
+        return
+    add_notify_user(_config, site.id, uid, _config_path)
+    await state.clear()
+    text, kb = subs_screen(site, data.get("kind", "all"), int(data.get("page", 0)))
+    await message.answer("✅ Подписчик добавлен\n\n" + text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def cb_delete(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if not site:
+        await callback.answer("Сайт не найден", show_alert=True)
+        return
+    kind, page = _parse_back(parts, 2)
+    await _show(callback, f"🗑 Удалить <b>{_esc(site.name)}</b> из мониторинга?\n{_esc(site.url)}",
+                _kb([[("🗑 Да, удалить", f"delc:{site.id}:{kind}:{page}"), ("✖️ Нет", f"site:{site.id}:{kind}:{page}")]]))
+
+
+@router.callback_query(F.data.startswith("delc:"))
+async def cb_delete_confirm(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    site = get_site_by_id(_config, parts[1])
+    if site:
+        remove_site(_config, site.id, _config_path)
+        if _database:
+            _database.delete_site_state(site.id)
+    kind, page = _parse_back(parts, 2)
+    text, kb = list_screen(callback.from_user.id, kind, page)
+    await _show(callback, ("🗑 Сайт удалён\n\n" if site else "") + text, kb)
+
+
+# ==================== Callback: добавление, поиск, проверка всех, журнал, админы ====================
+
+@router.callback_query(F.data == "add")
+async def cb_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    await state.set_state(AddStates.waiting_urls)
+    await _show(callback, ADD_PROMPT, _kb([[("✖️ Отмена", "dash")]]))
+
+
+@router.message(StateFilter(AddStates.waiting_urls))
+async def msg_add_urls(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(message.from_user.id):
+        return
+    await _add_sites_from_text(message, message.text or "")
+
+
+@router.callback_query(F.data == "search")
+async def cb_search(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SearchStates.waiting_query)
+    await _show(callback, "🔎 Введите часть названия или адреса сайта:", _kb([[("✖️ Отмена", "dash")]]))
+
+
+@router.message(StateFilter(SearchStates.waiting_query))
+async def msg_search(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = list_screen(message.from_user.id, f"q_{_clean_query(message.text or '')}", 0)
+    await _show(message, text, kb)
+
+
+@router.callback_query(F.data == "checkall")
+async def cb_check_all(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Проверить все сайты может только администратор", show_alert=True)
+        return
+    if _check_all_lock.locked():
+        await callback.answer("Проверка уже идёт", show_alert=True)
+        return
+    await callback.answer("⏳ Проверяю все сайты, это займёт до минуты")
+    await _run_check_all(callback.message)
+
+
+@router.callback_query(F.data == "changes")
+async def cb_changes(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    await _show(callback, _changes_text(), _kb([[("🏠 Меню", "dash")]]))
+
+
+@router.callback_query(F.data == "admins")
+async def cb_admins(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    text, kb = admins_screen()
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("admdel:"))
+async def cb_admin_del(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    try:
+        uid = int(callback.data.split(":")[1])
+    except ValueError:
+        return
+    if uid == callback.from_user.id:
+        await callback.answer("Себя удалить нельзя", show_alert=True)
+        return
+    if not remove_admin(_config, uid, _config_path):
+        await callback.answer("Нельзя удалить последнего администратора", show_alert=True)
+    text, kb = admins_screen()
+    await _show(callback, text, kb)
+
+
+@router.callback_query(F.data == "admadd")
+async def cb_admin_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_user_id)
+    await _show(callback, "👑 Введите Telegram ID нового администратора:", _kb([[("✖️ Отмена", "admins")]]))
+
+
+@router.message(StateFilter(AdminStates.waiting_user_id))
+async def msg_admin_add(message: Message, state: FSMContext) -> None:
+    try:
+        uid = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно число, например 123456789")
+        return
+    await state.clear()
+    add_admin(_config, uid, _config_path)
+    text, kb = admins_screen()
+    await message.answer("✅ Администратор добавлен\n\n" + text, parse_mode="HTML", reply_markup=kb)
+
+
+# Любой текст без состояния = поиск
+@router.message(F.text & ~F.text.startswith("/"))
+async def msg_free_text(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    query = _clean_query(message.text or "")
+    if not query:
+        return
+    text, kb = list_screen(message.from_user.id, f"q_{query}", 0)
+    await _show(message, text, kb)
+
+
+# ==================== Логика действий ====================
+
+def _clean_query(text: str) -> str:
+    return re.sub(r"[^\w.\-]+", "", text.strip().lower())[:24]
+
+
+def _find_site(key: str, user_id: int) -> Optional[SiteConfig]:
+    key = key.strip().lower()
+    site = get_site_by_id(_config, key)
+    if site:
+        return site
+    visible = _visible_sites(user_id)
+    for s in visible:
+        host = (urlparse(s.url).hostname or "").lower()
+        if key in (s.name.lower(), host, host.replace("www.", "")):
+            return s
+    matches = [s for s in visible if key in s.name.lower() or key in s.url.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _toggle_mute(user_id: int, site: SiteConfig, mute: bool) -> str:
+    if not _database:
+        return "База недоступна"
+    if mute:
+        st = _database.get_state(site.id)
+        if st.status != "DOWN":
+            return f"{site.name} сейчас доступен, глушить нечего"
+        _database.mute_for_user(user_id, site.id)
+        return f"🔇 Напоминания по {site.name} отключены до восстановления"
+    _database.unmute_for_user(user_id, site.id)
+    return f"🔔 Напоминания по {site.name} включены"
+
+
+def _changes_text() -> str:
+    entries = read_changes(20, _config_path)
+    if not entries:
+        return "📓 Журнал изменений пуст"
+    body = "\n".join(_esc(e) for e in entries)
+    text = f"📓 <b>Журнал изменений</b> (последние {len(entries)})\n\n<code>{body}</code>"
+    if len(text) > 4000:
+        text = text[:3990] + "…</code>"
+    return text
+
+
+def _domain_to_site_id(domain: str) -> str:
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    return re.sub(r"[^a-z0-9]+", "_", domain.lower()).strip("_") or "site"
+
+
+async def _add_sites_from_text(message: Message, text: str) -> None:
+    """Разбирает текст: ссылки + названия групп. Добавляет сайты и сразу проверяет."""
+    tokens = [t for t in re.split(r"[\s,;]+", text.strip()) if t]
+    groups = [t.lower() for t in tokens if t.lower() in KNOWN_GROUPS]
+    urls = [t for t in tokens if t.lower() not in KNOWN_GROUPS]
+    if not urls:
+        await message.answer("Не вижу ссылок. Пример: <code>/add shop.ru hosting</code>", parse_mode="HTML")
+        return
+    groups = normalize_groups(groups) or [DEFAULT_GROUP]
+    added: List[SiteConfig] = []
+    skipped: List[str] = []
+    for raw in urls:
+        url = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+        host = urlparse(url).hostname
+        if not host:
+            skipped.append(f"{raw}: не похоже на адрес")
+            continue
+        site_id = _domain_to_site_id(host)
+        if get_site_by_id(_config, site_id):
+            skipped.append(f"{host}: уже в мониторинге")
+            continue
+        site = SiteConfig(id=site_id, name=host, url=url, support_level=groups[0], groups=list(groups))
+        if add_site(_config, site, _config_path):
+            added.append(site)
+    lines = []
+    if added:
+        lines.append(f"➕ Добавлено: {len(added)} · группы: {_esc(groups_label(groups))}")
+        if _scheduler:
+            results = await asyncio.gather(*(_scheduler.check_single_site(s.id) for s in added), return_exceptions=True)
+            for s, r in zip(added, results):
+                lines.append(_esc(r if isinstance(r, str) else f"❌ {s.name} - ошибка проверки: {r}"))
+    for sk in skipped:
+        lines.append(f"⚠️ {_esc(sk)}")
+    rows = [[("📄 " + s.name, f"site:{s.id}:all:0")] for s in added[:5]]
+    if len(added) == 1:
+        rows.append([("🏷 Группы", f"grps:{added[0].id}:all:0")])
+    rows.append([("🏠 Меню", "dash")])
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=_kb(rows))
+
+
+async def _run_check_all(message: Message) -> None:
+    if _scheduler is None:
+        await message.answer("Планировщик не запущен")
+        return
+    if _check_all_lock.locked():
+        await message.answer("⏳ Проверка уже идёт, подождите")
+        return
+    async with _check_all_lock:
+        status = await message.answer(f"⏳ Проверяю {len(_config.sites)} сайтов...")
+        report = await _scheduler.run_immediate_check()
+    lines = [l for l in report.split("\n") if l.strip()]
+    bad = [l for l in lines if not l.startswith("✅")]
+    ok_n = len(lines) - len(bad)
+    text = f"🔍 <b>Проверка завершена</b>\n✅ {ok_n} в порядке"
+    if bad:
+        text += f" · ❌ {len(bad)} с ошибками:\n\n" + "\n".join(_esc(l) for l in bad[:40])
+        if len(bad) > 40:
+            text += f"\n… и ещё {len(bad) - 40}"
+    try:
+        await status.edit_text(text[:4000], parse_mode="HTML", reply_markup=_kb([[("🏠 Меню", "dash")]]))
+    except Exception:
+        await message.answer(text[:4000], parse_mode="HTML", reply_markup=_kb([[("🏠 Меню", "dash")]]))
+
+
+# ==================== Запуск ====================
 
 def setup_bot(
     config: Config,
@@ -2028,22 +1200,9 @@ def setup_bot(
     notifier: TelegramNotifier,
     scheduler: MonitorScheduler = None,
     config_path: str = "config.yaml"
-) -> tuple[Bot, Dispatcher]:
-    """
-    Настраивает и возвращает бота и диспетчер.
-
-    Args:
-        config: Конфигурация приложения
-        database: База данных
-        notifier: Telegram-нотификатор
-        scheduler: Планировщик (опционально)
-        config_path: Путь к файлу конфигурации
-
-    Returns:
-        Кортеж (Bot, Dispatcher)
-    """
+) -> tuple:
+    """Настраивает и возвращает (Bot, Dispatcher)."""
     global _config, _database, _notifier, _scheduler, _config_path
-
     _config = config
     _database = database
     _notifier = notifier
@@ -2054,36 +1213,26 @@ def setup_bot(
     bot = Bot(token=config.telegram.bot_token, session=session)
     dp = Dispatcher()
     dp.include_router(router)
-
     return bot, dp
 
 
 async def _setup_bot_commands(bot: Bot) -> None:
-    """Устанавливает меню команд бота."""
     commands = [
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="myid", description="Показать мой Telegram ID"),
-        BotCommand(command="my_sites", description="Мои сайты"),
-        BotCommand(command="muted", description="Заглушенные сайты"),
-        BotCommand(command="status_all", description="Статус всех сайтов (админ)"),
-        BotCommand(command="check_now", description="Проверить все сейчас (админ)"),
-        BotCommand(command="stats", description="Статистика сайтов (админ)"),
-        BotCommand(command="sites", description="Управление сайтами (админ)"),
-        BotCommand(command="add_site", description="Добавить сайт (админ)"),
+        BotCommand(command="start", description="Главный экран"),
+        BotCommand(command="down", description="Что сейчас лежит"),
+        BotCommand(command="check", description="Проверить все сайты или один"),
+        BotCommand(command="find", description="Найти сайт"),
+        BotCommand(command="add", description="Добавить сайт (админ)"),
         BotCommand(command="changes", description="Журнал изменений (админ)"),
+        BotCommand(command="help", description="Справка"),
+        BotCommand(command="myid", description="Мой Telegram ID"),
     ]
     await bot.set_my_commands(commands)
     logger.info("Меню команд установлено")
 
 
 async def start_bot(bot: Bot, dp: Dispatcher) -> None:
-    """
-    Запускает бота в режиме polling.
-
-    Args:
-        bot: Экземпляр бота
-        dp: Диспетчер
-    """
+    """Запускает бота в режиме polling."""
     await _setup_bot_commands(bot)
     # Если раньше бот работал через webhook (другой сервер), polling конфликтует с ним
     await bot.delete_webhook(drop_pending_updates=True)
@@ -2091,62 +1240,24 @@ async def start_bot(bot: Bot, dp: Dispatcher) -> None:
     await dp.start_polling(bot)
 
 
-async def start_bot_webhook(
-    bot: Bot,
-    dp: Dispatcher,
-    webhook_url: str,
-    webhook_path: str,
-    host: str,
-    port: int
-) -> web.Application:
-    """
-    Запускает бота в режиме webhook.
-
-    Args:
-        bot: Экземпляр бота
-        dp: Диспетчер
-        webhook_url: Полный URL вебхука (https://domain.com/webhook)
-        webhook_path: Путь вебхука (/webhook)
-        host: Хост для прослушивания
-        port: Порт для прослушивания
-
-    Returns:
-        aiohttp Application
-    """
+async def start_bot_webhook(bot: Bot, dp: Dispatcher, webhook_url: str, webhook_path: str,
+                            host: str, port: int) -> web.Application:
+    """Запускает бота в режиме webhook, возвращает aiohttp Application."""
     await _setup_bot_commands(bot)
-
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook установлен: {webhook_url}")
-
     app = web.Application()
-
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot
-    )
-    webhook_requests_handler.register(app, path=webhook_path)
-
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
-
     logger.info(f"Telegram-бот запущен (webhook) на {host}:{port}")
-
     return app
 
 
 async def run_webhook_server(app: web.Application, host: str, port: int) -> None:
-    """
-    Запускает webhook сервер.
-
-    Args:
-        app: aiohttp Application
-        host: Хост
-        port: Порт
-    """
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-
     while True:
         await asyncio.sleep(3600)
