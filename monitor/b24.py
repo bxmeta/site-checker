@@ -12,6 +12,7 @@
 Команды в чате: /status, /check [id], /mute id, /unmute id, /add url, /del id, /help.
 """
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -76,7 +77,8 @@ class B24AuthStorage:
     def save(self) -> None:
         try:
             tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
         except Exception as e:
@@ -484,8 +486,13 @@ class B24BotApp:
         auth = payload.get("auth") or {}
         token = str(auth.get("application_token") or "") if isinstance(auth, dict) else ""
 
+        client_ip = request.headers.get("X-Real-IP") or (request.remote or "")
+        if self.b24.allowed_ips and client_ip not in self.b24.allowed_ips:
+            logger.warning(f"B24: событие {event} с адреса {client_ip} отклонено (не в allowed_ips)")
+            return web.Response(status=403, text="forbidden")
+
         if not self._check_token(token):
-            logger.warning(f"B24: событие {event} с неверным application_token отклонено")
+            logger.warning(f"B24: событие {event} с адреса {client_ip} с неверным application_token отклонено")
             return web.Response(status=403, text="forbidden")
 
         data = payload.get("data") or {}
@@ -497,13 +504,23 @@ class B24BotApp:
         return web.Response(text="ok")
 
     def _check_token(self, token: str) -> bool:
-        stored = self.storage.application_token
+        """
+        Проверка auth[application_token] события.
+
+        Эталон берётся из config.yaml (bitrix24.application_token), иначе из b24_auth.json.
+        Если эталона нет вообще, токен запоминается из первого события: при регистрации бота
+        через вебхук портал его не возвращает. Окно доверия закрывается списком allowed_ips
+        (события принимаются только с IP портала) и первым же принятым событием.
+        """
+        stored = self.b24.application_token or self.storage.application_token
         if stored:
-            return bool(token) and token == stored
+            return bool(token) and hmac.compare_digest(token, stored)
         if token:
-            # Первое событие после регистрации: запоминаем токен
             self.storage.application_token = token
-            logger.info("B24: сохранён application_token из первого события")
+            logger.warning(
+                "B24: эталонного application_token не было, запомнен токен из первого события. "
+                "Для надёжности скопируйте его из b24_auth.json в config.yaml (bitrix24.application_token)"
+            )
             return True
         return False
 

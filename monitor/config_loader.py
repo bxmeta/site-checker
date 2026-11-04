@@ -2,6 +2,7 @@
 Модуль загрузки конфигурации из YAML-файла.
 """
 import os
+import stat
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -37,6 +38,8 @@ class Bitrix24Config:
     chat_title: str = "🌐 Мониторинг сайтов"
     chat_dialog_id: str = ""              # chat8493; пусто - чат создаётся при первом запуске
     admin_users: List[int] = field(default_factory=list)
+    application_token: str = ""           # auth[application_token] из событий портала; пусто - запомнить из первого события
+    allowed_ips: List[str] = field(default_factory=list)  # откуда принимать события (IP портала); пусто - отовсюду
 
 
 @dataclass
@@ -156,6 +159,8 @@ def load_config(config_path: str = "config.yaml") -> Config:
         chat_title=str(b24_data.get("chat_title") or b24_defaults.chat_title),
         chat_dialog_id=str(b24_data.get("chat_dialog_id", "") or ""),
         admin_users=_int_list(b24_data.get("admin_users", [])),
+        application_token=str(b24_data.get("application_token", "") or "").strip(),
+        allowed_ips=[str(x).strip() for x in (b24_data.get("allowed_ips", []) or []) if str(x).strip()],
     )
 
     ssl_data = data.get("ssl", {}) or {}
@@ -251,6 +256,8 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
             "chat_title": config.bitrix24.chat_title,
             "chat_dialog_id": config.bitrix24.chat_dialog_id,
             "admin_users": config.bitrix24.admin_users,
+            "application_token": config.bitrix24.application_token,
+            "allowed_ips": config.bitrix24.allowed_ips,
         },
         "ssl": {
             "expiry_warn_days": config.ssl.expiry_warn_days,
@@ -275,9 +282,15 @@ def save_config(config: Config, config_path: str = "config.yaml") -> None:
             "notify_b24_users": site.notify_b24_users,
         })
 
+    # Конфиг содержит секреты: временный файл создаётся с правами 0600, режим исходного файла сохраняется
     tmp_path = config_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    try:
+        os.chmod(tmp_path, stat.S_IMODE(os.stat(config_path).st_mode))
+    except OSError:
+        pass
     os.replace(tmp_path, config_path)
 
 
