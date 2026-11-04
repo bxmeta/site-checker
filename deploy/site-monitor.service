@@ -1,0 +1,29 @@
+[Unit]
+Description=Site monitor (site-checker): проверка доступности сайтов, уведомления в Telegram и Bitrix24
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sitemon
+Group=sitemon
+WorkingDirectory=/opt/site-checker/app
+Environment=SITE_CHECKER_DATA=/opt/site-checker
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/opt/site-checker/venv/bin/python /opt/site-checker/app/main.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+Nice=5
+# Без Telegram-бота процесс занимает ~60 МБ, с aiogram ~170 МБ (сам импорт aiogram 3 стоит ~150 МБ)
+MemoryHigh=200M
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/site-checker
+
+[Install]
+WantedBy=multi-user.target
