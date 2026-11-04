@@ -45,7 +45,7 @@ sites:
   - id: example_com
     name: example.com
     url: https://example.com
-    groups: [premium]           # hosting / vip / premium / standard, можно несколько
+    groups: [premium]           # hosting / vip / standard, можно несколько
     check_ssl: true
     check_http_code: true
     expected_code: 200

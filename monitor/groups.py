@@ -9,9 +9,11 @@ from typing import Dict, Iterable, List, Tuple
 KNOWN_GROUPS: Dict[str, Tuple[str, str]] = {
     "hosting": ("🏠", "Хостинг"),
     "vip": ("⭐", "VIP"),
-    "premium": ("🟢", "Премиум"),
     "standard": ("🟡", "Стандарт"),
 }
+
+# Старые названия: premium из прежних конфигов = vip
+GROUP_ALIASES = {"premium": "vip"}
 
 DEFAULT_GROUP = "standard"
 
@@ -21,6 +23,7 @@ def normalize_groups(values: Iterable[str]) -> List[str]:
     seen: List[str] = []
     for v in values or []:
         g = str(v or "").strip().lower()
+        g = GROUP_ALIASES.get(g, g)
         if g in ("", "none") or g in seen:
             continue
         seen.append(g)
