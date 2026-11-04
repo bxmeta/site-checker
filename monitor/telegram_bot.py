@@ -235,7 +235,10 @@ def _support_level_keyboard(site_id: str = "") -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(text="🟡 Стандарт", callback_data=f"{prefix}standard"),
-            InlineKeyboardButton(text="🟢 Премиум", callback_data=f"{prefix}premium"),
+            InlineKeyboardButton(text="🟢 Премиум", callback_data=f"{prefix}premium")
+        ],
+        [
+            InlineKeyboardButton(text="⭐ VIP", callback_data=f"{prefix}vip"),
             InlineKeyboardButton(text="🏠 Хостинг", callback_data=f"{prefix}hosting")
         ]
     ]
