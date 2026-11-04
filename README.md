@@ -56,7 +56,7 @@ sites:
   - id: "site1"
     name: "Example"
     url: "https://example.com"
-    support_level: "premium"   # none / standard / premium
+    support_level: "premium"   # none / standard / premium / hosting (сайт на нашем хостинге, реагируем сами)
     check_ssl: true
     check_http_code: true
     expected_code: 200
@@ -200,7 +200,7 @@ journalctl -u site-monitor -f
 
 ### Редактирование сайта
 - Изменение названия и URL
-- Выбор уровня поддержки (none/standard/premium)
+- Выбор уровня поддержки (none/standard/premium/hosting)
 - Настройка ожидаемого HTTP кода
 - Включение/отключение проверки SSL
 - Включение/отключение проверки HTTP кода

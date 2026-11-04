@@ -44,7 +44,7 @@ sites:
   - id: example_com
     name: example.com
     url: https://example.com
-    support_level: premium      # none / standard / premium
+    support_level: premium      # none / standard / premium / hosting
     check_ssl: true
     check_http_code: true
     expected_code: 200
