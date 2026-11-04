@@ -76,7 +76,7 @@ class SiteConfig:
     name: str
     url: str
     support_level: str = "none"                              # устарело: первая группа из groups
-    groups: List[str] = field(default_factory=list)          # hosting / vip / premium / standard, можно несколько
+    groups: List[str] = field(default_factory=list)          # hosting / vip / standard, можно несколько
     check_ssl: bool = True
     check_http_code: bool = True
     expected_code: int = 200

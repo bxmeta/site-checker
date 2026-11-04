@@ -174,6 +174,11 @@ def _short_error(state: Optional[SiteState]) -> str:
     return short or (state.last_error_type or "ошибка")
 
 
+def _can_view(user_id: int, site: SiteConfig) -> bool:
+    """Карточка и действия с сайтом доступны админам и подписчикам сайта."""
+    return _is_admin(user_id) or user_id in site.notify_users
+
+
 def _visible_sites(user_id: int) -> List[SiteConfig]:
     if _config is None:
         return []
@@ -244,7 +249,7 @@ def dashboard_screen(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     lines = ["🌐 <b>Мониторинг сайтов</b>"]
     if not sites:
         lines.append("")
-        lines.append("Вы пока не подписаны ни на один сайт. Найдите сайт через 🔎 Поиск и нажмите «Подписаться».")
+        lines.append("Вы пока не подписаны ни на один сайт. Сообщите администратору свой ID (кнопка «Мой ID»).")
     else:
         summary = f"🟢 {up_count} в порядке · 🔴 {len(down)} недоступн{'ы' if len(down) == 1 else 'о'}"
         if muted:
@@ -483,7 +488,7 @@ HELP_TEXT = (
     "/myid - ваш Telegram ID\n\n"
     "Любой текст без команды - поиск по сайтам.\n"
     "Уведомления о падении и восстановлении приходят подписчикам сайта и админам. "
-    "Подписаться можно кнопкой в карточке сайта."
+    "Подписчиков добавляет администратор в карточке сайта (нужен ваш ID: /myid)."
 )
 
 ADD_PROMPT = (
@@ -633,8 +638,7 @@ async def cb_help(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "myid")
 async def cb_myid(callback: CallbackQuery) -> None:
     await _show(callback, f"🆔 Ваш Telegram ID: <code>{callback.from_user.id}</code>\n\n"
-                          "Сообщите его администратору, чтобы вас добавили в подписчики, "
-                          "или подпишитесь сами в карточке сайта.", _kb([[("🏠 Меню", "dash")]]))
+                          "Сообщите его администратору, чтобы вас добавили в подписчики сайтов.", _kb([[("🏠 Меню", "dash")]]))
 
 
 @router.callback_query(F.data.startswith("list:"))
@@ -651,7 +655,7 @@ async def cb_site(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     parts = callback.data.split(":")
     site = get_site_by_id(_config, parts[1])
-    if not site:
+    if not site or not _can_view(callback.from_user.id, site):
         await callback.answer("Сайт не найден (удалён?)", show_alert=True)
         return
     kind, page = _parse_back(parts, 2)
@@ -663,7 +667,7 @@ async def cb_site(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_hist(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     site = get_site_by_id(_config, parts[1])
-    if not site:
+    if not site or not _can_view(callback.from_user.id, site):
         await callback.answer("Сайт не найден", show_alert=True)
         return
     kind, page = _parse_back(parts, 2)
@@ -677,7 +681,7 @@ async def cb_hist(callback: CallbackQuery) -> None:
 async def cb_check_site(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     site = get_site_by_id(_config, parts[1])
-    if not site:
+    if not site or not _can_view(callback.from_user.id, site):
         await callback.answer("Сайт не найден", show_alert=True)
         return
     await callback.answer("⏳ Проверяю...")
@@ -697,7 +701,7 @@ async def cb_mute(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     mute = parts[0] in ("mute", "mute_site")
     site = get_site_by_id(_config, parts[1])
-    if not site:
+    if not site or not _can_view(callback.from_user.id, site):
         await callback.answer("Сайт не найден", show_alert=True)
         return
     result = _toggle_mute(callback.from_user.id, site, mute)
@@ -722,6 +726,10 @@ async def cb_subscribe(callback: CallbackQuery) -> None:
         return
     uid = callback.from_user.id
     if parts[0] == "sub":
+        # Подписать себя может только администратор; остальных добавляет админ в карточке сайта
+        if not _is_admin(uid):
+            await callback.answer("Подписку оформляет администратор: сообщите ему свой ID (/myid)", show_alert=True)
+            return
         add_notify_user(_config, site.id, uid, _config_path)
         note = "🔔 Вы подписаны на уведомления"
     else:
@@ -1086,7 +1094,7 @@ def _find_site(key: str, user_id: int) -> Optional[SiteConfig]:
     key = key.strip().lower()
     site = get_site_by_id(_config, key)
     if site:
-        return site
+        return site if _can_view(user_id, site) else None
     visible = _visible_sites(user_id)
     for s in visible:
         host = (urlparse(s.url).hostname or "").lower()

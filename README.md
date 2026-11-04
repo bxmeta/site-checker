@@ -56,7 +56,7 @@ sites:
   - id: "site1"
     name: "Example"
     url: "https://example.com"
-    support_level: "premium"   # none / standard / premium / vip / hosting (hosting: сайт на нашем хостинге, реагируем сами)
+    groups: [vip]              # hosting / vip / standard, можно несколько (hosting: сайт на нашем хостинге, реагируем сами)
     check_ssl: true
     check_http_code: true
     expected_code: 200
@@ -186,7 +186,7 @@ journalctl -u site-monitor -f
   Сайт сразу проверяется.
 - Любой текст без команды = поиск по сайтам. `/down` - что лежит, `/check [сайт]`, `/find текст`,
   `/mute сайт`, `/unmute сайт`, `/changes`, `/admins`, `/myid`, `/help`.
-- Подписаться на сайт пользователь может сам кнопкой в карточке (нужно найти сайт через поиск).
+- Подписчиков добавляет администратор в карточке сайта по Telegram ID (пользователь узнаёт его через /myid); отписаться пользователь может сам.
 
 ## Группы сайтов
 
@@ -345,7 +345,7 @@ bitrix24:
 
 Название: Example
 URL: https://example.com
-Поддержка: premium
+Группы: ⭐ VIP
 Проблема: Таймаут: сервер не ответил за 10 с
 Что это значит: Сервер принимает соединение или молчит дольше лимита. Смотрите диагностику ниже.
 Код: нет ответа
@@ -381,7 +381,7 @@ URL: https://example.com
 
 Название: Example
 URL: https://example.com
-Статус поддержки: premium
+Группы: ⭐ VIP
 Код: 200
 Простой: 47 мин
 Время: 01.01.2025 12:47:00 (UTC+4)
