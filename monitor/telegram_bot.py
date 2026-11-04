@@ -8,6 +8,7 @@ from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,6 +24,7 @@ from .config_loader import (
     add_site, remove_site, update_site, add_notify_user, remove_notify_user,
     add_admin, remove_admin
 )
+from .changelog import set_actor, reset_actor, tg_actor, read_changes
 from .database import Database
 from .notifier import TelegramNotifier, format_duration
 from .scheduler import run_immediate_check, MonitorScheduler
@@ -32,6 +34,21 @@ from .retry_logic import check_with_retry
 logger = logging.getLogger("site_monitor")
 
 router = Router()
+
+
+async def _actor_middleware(handler, event, data):
+    """Запоминает автора действия для журнала изменений (changes.log)."""
+    user = getattr(event, "from_user", None)
+    token = set_actor(tg_actor(user)) if user else None
+    try:
+        return await handler(event, data)
+    finally:
+        if token is not None:
+            reset_actor(token)
+
+
+router.message.outer_middleware(_actor_middleware)
+router.callback_query.outer_middleware(_actor_middleware)
 
 _config: Optional[Config] = None
 _database: Optional[Database] = None
@@ -64,14 +81,14 @@ async def _check_new_site(site: SiteConfig) -> str:
     Немедленно проверяет новый сайт и возвращает результат.
     Если сайт недоступен — сразу уведомляет всех получателей.
     """
-    result = await check_with_retry(site, _config.default)
+    result = await check_with_retry(site, _config.default, _config.ssl)
 
     if result.success:
-        # Всё ок — записываем успешное состояние
+        # Всё ок - записываем успешное состояние
         _database.update_on_success(site.id)
         return f"✅ Проверка пройдена (код {result.status_code})"
     else:
-        # Сайт недоступен — сразу помечаем DOWN и уведомляем
+        # Сайт недоступен - сразу помечаем DOWN и уведомляем
         # Используем retry_count=1 чтобы сразу перейти в DOWN
         status_changed = _database.update_on_failure(
             site.id,
@@ -80,6 +97,8 @@ async def _check_new_site(site: SiteConfig) -> str:
             error_message=result.error
         )
         if status_changed:
+            if _scheduler is not None:
+                await _scheduler.attach_diagnostics(site, result)
             await _notifier.notify_site_down(site, result)
         return f"❌ Проблема: {result.error}"
 
@@ -97,7 +116,11 @@ def _extract_domain(url: str) -> str:
 
 
 def _generate_site_id(domain: str) -> str:
-    """Генерирует ID сайта из домена."""
+    """Генерирует ID сайта из домена (кириллические домены через Punycode)."""
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
     # Заменяем точки и дефисы на подчёркивания
     site_id = domain.replace(".", "_").replace("-", "_")
     # Убираем лишние символы
@@ -454,6 +477,27 @@ async def cmd_sites(message: Message) -> None:
         parse_mode="HTML",
         reply_markup=_sites_list_keyboard()
     )
+
+
+@router.message(Command("changes"))
+async def cmd_changes(message: Message) -> None:
+    """Обработчик команды /changes: журнал изменений конфигурации (только админы)."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("❌ Эта команда доступна только администраторам")
+        return
+
+    entries = read_changes(20, _config_path)
+    if not entries:
+        await message.answer("📓 Журнал изменений пуст")
+        return
+
+    body = "\n".join(
+        e.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for e in entries
+    )
+    text = f"📓 <b>Журнал изменений</b> (последние {len(entries)})\n\n<code>{body}</code>"
+    if len(text) > 4000:
+        text = text[:3990] + "…</code>"
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("stats"))
@@ -1218,7 +1262,7 @@ async def callback_check_site(callback: CallbackQuery) -> None:
     await callback.answer("⏳ Проверяю сайт...")
 
     from .retry_logic import check_site_single
-    result = await check_site_single(site, _config.default)
+    result = await check_site_single(site, _config.default, _config.ssl)
 
     status = "✅ Доступен" if result.success else "❌ Недоступен"
     code_str = f" (код {result.status_code})" if result.status_code else ""
@@ -2002,7 +2046,8 @@ def setup_bot(
     _scheduler = scheduler
     _config_path = config_path
 
-    bot = Bot(token=config.telegram.bot_token)
+    session = AiohttpSession(proxy=config.telegram.proxy) if config.telegram.proxy else None
+    bot = Bot(token=config.telegram.bot_token, session=session)
     dp = Dispatcher()
     dp.include_router(router)
 
@@ -2021,6 +2066,7 @@ async def _setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="stats", description="Статистика сайтов (админ)"),
         BotCommand(command="sites", description="Управление сайтами (админ)"),
         BotCommand(command="add_site", description="Добавить сайт (админ)"),
+        BotCommand(command="changes", description="Журнал изменений (админ)"),
     ]
     await bot.set_my_commands(commands)
     logger.info("Меню команд установлено")

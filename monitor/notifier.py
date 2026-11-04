@@ -5,11 +5,16 @@ import logging
 from typing import List, Optional, Tuple
 
 import aiohttp
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from .config_loader import SiteConfig, TelegramConfig
 from .checker import CheckResult
+from .ssl_checker import SSLCheckResult
 from .time_utils import format_for_message
+from .messages import format_down_message, format_ssl_expiring_message
+
+
+def _html_bold(text: str) -> str:
+    return f"<b>{text}</b>"
 
 logger = logging.getLogger("site_monitor")
 
@@ -42,12 +47,13 @@ class TelegramNotifier:
         self.bot_token = config.bot_token
         self.admin_ids = config.admin_ids
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}"
+        self.proxy = config.proxy or None
 
     async def send_message(
         self,
         chat_id: int,
         text: str,
-        reply_markup: Optional[InlineKeyboardMarkup] = None
+        reply_markup: Optional[dict] = None
     ) -> bool:
         """
         Отправляет сообщение в Telegram.
@@ -55,7 +61,7 @@ class TelegramNotifier:
         Args:
             chat_id: ID чата
             text: Текст сообщения
-            reply_markup: Inline-клавиатура (опционально)
+            reply_markup: Inline-клавиатура в формате Bot API (dict) или aiogram InlineKeyboardMarkup
 
         Returns:
             True, если сообщение отправлено успешно
@@ -68,11 +74,13 @@ class TelegramNotifier:
         }
 
         if reply_markup:
-            payload["reply_markup"] = reply_markup.model_dump(exclude_none=True)
+            if hasattr(reply_markup, "model_dump"):
+                reply_markup = reply_markup.model_dump(exclude_none=True)
+            payload["reply_markup"] = reply_markup
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, proxy=self.proxy) as response:
                     if response.status == 200:
                         return True
                     else:
@@ -83,31 +91,21 @@ class TelegramNotifier:
             logger.error(f"Ошибка отправки в Telegram: {e}")
             return False
 
-    def _create_down_keyboard(self, site_id: str) -> InlineKeyboardMarkup:
-        """Создаёт клавиатуру для уведомления о падении."""
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔇 Заглушить",
-                    callback_data=f"mute_site:{site_id}"
-                ),
-                InlineKeyboardButton(
-                    text="🔄 Проверить",
-                    callback_data=f"check_now:{site_id}"
-                )
-            ]
-        ])
+    # Клавиатуры собираются как dict Bot API, а не aiogram-модели: модуль не тянет aiogram
+    # (его импорт стоит ~150 МБ памяти), а нотификатор работает и без Telegram-бота.
 
-    def _create_unmute_keyboard(self, site_id: str) -> InlineKeyboardMarkup:
+    def _create_down_keyboard(self, site_id: str) -> dict:
+        """Создаёт клавиатуру для уведомления о падении."""
+        return {"inline_keyboard": [[
+            {"text": "🔇 Заглушить", "callback_data": f"mute_site:{site_id}"},
+            {"text": "🔄 Проверить", "callback_data": f"check_now:{site_id}"},
+        ]]}
+
+    def _create_unmute_keyboard(self, site_id: str) -> dict:
         """Создаёт клавиатуру для подтверждения заглушки."""
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔔 Включить обратно",
-                    callback_data=f"unmute_site:{site_id}"
-                )
-            ]
-        ])
+        return {"inline_keyboard": [[
+            {"text": "🔔 Включить обратно", "callback_data": f"unmute_site:{site_id}"},
+        ]]}
 
     def _get_all_recipients(self, site: SiteConfig, user_ids: Optional[List[int]] = None) -> List[int]:
         """Возвращает список всех получателей: подписчики + админы (без дубликатов)."""
@@ -167,6 +165,22 @@ class TelegramNotifier:
             else:
                 logger.error(f"[{site.id}] Не удалось отправить уведомление пользователю {user_id}")
 
+    async def notify_ssl_expiring(
+        self,
+        site: SiteConfig,
+        ssl_result: SSLCheckResult,
+        user_ids: Optional[List[int]] = None
+    ) -> None:
+        """Предупреждает об истечении платного SSL-сертификата."""
+        recipients = self._get_all_recipients(site, user_ids)
+        message = format_ssl_expiring_message(site, ssl_result, _html_bold)
+        for user_id in recipients:
+            success = await self.send_message(user_id, message)
+            if success:
+                logger.info(f"[{site.id}] Предупреждение об истечении SSL отправлено пользователю {user_id}")
+            else:
+                logger.error(f"[{site.id}] Не удалось отправить предупреждение SSL пользователю {user_id}")
+
     async def send_reminder(
         self,
         site: SiteConfig,
@@ -208,37 +222,8 @@ class TelegramNotifier:
                 logger.error(f"[{site.id}] Не удалось отправить напоминание пользователю {user_id}")
 
     def _format_down_message(self, site: SiteConfig, check_result: CheckResult) -> str:
-        """Форматирует сообщение о падении сайта."""
-        status_code_str = str(check_result.status_code) if check_result.status_code else "N/A"
-
-        # Разные заголовки для разных типов ошибок
-        error_type = check_result.error_type or "unknown"
-
-        if error_type == "keyword_missing":
-            title = "⚠️ <b>Контент изменился</b>"
-            description = "Ключевое слово не найдено на странице"
-        elif error_type == "wrong_code":
-            title = "⚠️ <b>Неверный код ответа</b>"
-            description = f"Ожидался {site.expected_code}, получен {status_code_str}"
-        elif error_type in ("ssl_expired", "ssl_mismatch"):
-            title = "🔐 <b>Проблема с SSL</b>"
-            description = check_result.error
-        elif error_type == "timeout":
-            title = "🚨 <b>Сайт недоступен</b>"
-            description = "Превышено время ожидания"
-        else:
-            title = "🚨 <b>Сайт недоступен</b>"
-            description = check_result.error
-
-        return (
-            f"{title}\n\n"
-            f"Название: {site.name}\n"
-            f"URL: {site.url}\n"
-            f"Поддержка: {site.support_level}\n"
-            f"Проблема: {description}\n"
-            f"Код: {status_code_str}\n"
-            f"Время: {format_for_message()}"
-        )
+        """Форматирует сообщение о падении сайта (общий текст с диагностикой)."""
+        return format_down_message(site, check_result, _html_bold)
 
     def _format_up_message(
         self,
