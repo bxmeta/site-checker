@@ -262,6 +262,12 @@ class Database:
     def delete_site_state(self, site_id: str) -> None:
         """Удаляет состояние и заглушки сайта (при удалении сайта из конфига)."""
         with self._get_connection() as conn:
+            # Незакрытый инцидент иначе считался бы простоем, если сайт вернут с тем же id
+            open_incidents = conn.execute(
+                "SELECT id FROM incidents WHERE site_id = ? AND ended_at IS NULL", (site_id,)
+            ).fetchall()
+            for row in open_incidents:
+                self._close_incident(conn, row["id"])
             conn.execute("DELETE FROM sites_state WHERE site_id = ?", (site_id,))
             conn.execute("DELETE FROM user_mutes WHERE site_id = ?", (site_id,))
             conn.execute("DELETE FROM ssl_warnings WHERE site_id = ?", (site_id,))

@@ -768,7 +768,7 @@ class B24BotApp:
             await self.notifier.send_message(dialog_id, "Укажите id сайта: /del id. Список: /status")
             return
         remove_site(self.config, site.id, self.config_path)
-        self.database.clear_mutes_for_site(site.id)
+        self.database.delete_site_state(site.id)
         await self.notifier.send_message(dialog_id, f"➖ Сайт удалён из мониторинга: {site.name} ({site.id})")
 
     async def _cmd_help(self, dialog_id: str, from_user: int) -> None:

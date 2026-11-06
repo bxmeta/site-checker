@@ -128,9 +128,21 @@ class MonitorScheduler:
     async def _check_site(self, site: SiteConfig) -> CheckResult:
         """Проверяет один сайт (с повторами) под семафором и обрабатывает результат."""
         async with self._semaphore:
-            result = await check_with_retry(site, self.config.default, self.config.ssl)
+            result = await check_with_retry(
+                site, self.config.default, self.config.ssl,
+                is_monitored=lambda: self._is_monitored(site),
+            )
+        # Сайт могли удалить, пока шла серия повторов (до 10 минут ожидания):
+        # результат уже никому не нужен, уведомлять и писать состояние нельзя.
+        if not self._is_monitored(site):
+            logger.info(f"[{site.id}] Сайт удалён из мониторинга во время проверки, результат отброшен")
+            return result
         await self._handle_result(site, result)
         return result
+
+    def _is_monitored(self, site: SiteConfig) -> bool:
+        """True, если сайт всё ещё есть в конфигурации."""
+        return any(s.id == site.id for s in self.config.sites)
 
     async def _check_sites(self, sites: List[SiteConfig]) -> List[Optional[CheckResult]]:
         """Параллельно проверяет список сайтов, ошибки одного не ломают остальные."""
@@ -186,7 +198,9 @@ class MonitorScheduler:
         for site_id, reminder_count in sites_needing_reminder:
             site = next((s for s in self.config.sites if s.id == site_id), None)
             if not site:
-                logger.warning(f"Сайт {site_id} не найден в конфигурации")
+                # Состояние осталось от удалённого сайта: убираем, иначе предупреждение на каждом цикле
+                logger.warning(f"Сайт {site_id} не найден в конфигурации, его состояние удалено")
+                self.database.delete_site_state(site_id)
                 continue
 
             try:

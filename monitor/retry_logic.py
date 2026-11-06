@@ -14,7 +14,8 @@ logger = logging.getLogger("site_monitor")
 async def check_with_retry(
     site: SiteConfig,
     defaults: DefaultConfig,
-    ssl_config: Optional[SslConfig] = None
+    ssl_config: Optional[SslConfig] = None,
+    is_monitored: Optional[Callable[[], bool]] = None
 ) -> CheckResult:
     """
     Выполняет проверку сайта с повторными попытками при неудаче.
@@ -22,6 +23,8 @@ async def check_with_retry(
     Args:
         site: Конфигурация сайта
         defaults: Настройки по умолчанию (содержат retry_count и retry_interval_minutes)
+        is_monitored: Возвращает False, если сайт за время ожидания удалили из мониторинга;
+            тогда повторы прекращаются
 
     Returns:
         CheckResult - результат проверки
@@ -49,6 +52,9 @@ async def check_with_retry(
                 f"Повтор через {defaults.retry_interval_minutes} мин."
             )
             await asyncio.sleep(retry_interval_seconds)
+            if is_monitored is not None and not is_monitored():
+                logger.info(f"[{site.id}] Сайт удалён из мониторинга, повторные проверки прекращены")
+                return last_result
         else:
             logger.info(
                 f"[{site.id}] Все {retry_count} попытки неудачны. Последняя ошибка: {result.error}"
